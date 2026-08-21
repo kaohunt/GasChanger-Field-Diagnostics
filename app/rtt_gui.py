@@ -8,6 +8,7 @@ import codecs
 import csv
 import glob
 import hashlib
+import json
 import os
 import queue
 import re
@@ -44,6 +45,29 @@ EVENT_RE = re.compile(
     r"event tick=(\d+) code=(\d+) name=([A-Z_]+) "
     r"arg0=(0x[0-9A-Fa-f]+) arg1=(0x[0-9A-Fa-f]+)"
 )
+
+EVENT_DETAILS = {
+    "BOOT": ("Controller boot", "arg0=reset flags, arg1=boot counter"),
+    "ALARM_CHANGE": ("Alarm bitmap changed", "arg0=previous bitmap, arg1=new bitmap"),
+    "VALVE_REQUEST": ("3-way valve direction requested", "arg0=direction, arg1=request reason"),
+    "VALVE_OUTPUT": ("Valve drive output changed", "arg0=direction, arg1=output/power state"),
+    "VALVE_FEEDBACK": ("Physical OPEN feedback changed", "arg0=previous/direction, arg1=new/port state"),
+    "CHECK_SET": ("Valve CHECK fault asserted", "No valid single-side OPEN feedback was confirmed in time"),
+    "CHECK_CLEAR": ("Valve CHECK fault cleared", "A valid physical OPEN feedback was confirmed"),
+    "SWITCH_BEGIN": ("Automatic switching event began", "arg0/arg1 contain switching state and event masks"),
+    "SWITCH_DONE": ("Automatic switching event completed", "arg0/arg1 contain completion/result masks"),
+    "WIFI_LINK": ("Wi-Fi link state changed", "arg0=previous state, arg1=new state"),
+    "ETH_LINK": ("Ethernet PHY link changed", "arg0=previous link, arg1=new link"),
+    "ADC_VALID_CHANGE": ("Pressure ADC validity changed", "Bit mask: bit0=LEFT, bit1=RIGHT, bit2=OUT; arg0=old, arg1=new"),
+    "ADC_READY": ("ADC startup alarm suppression ended", "arg0=elapsed ms, arg1=stable sample count"),
+    "GPIO_HEALTH": ("GPIO expander health changed", "arg0=0 fault/1 recovered, arg1=diagnostic counter"),
+    "GPIO_RECOVERY": ("GPIO expander recovery completed", "arg0=result, arg1=reinitialization count"),
+    "RS485_ERROR": ("RS485 UART line error latched", "arg0=USART error flags, arg1=error count"),
+    "RS485_RECOVERY": ("RS485 line returned to normal", "arg0=previous USART flags, arg1=clear count"),
+    "ETH_INIT": ("Ethernet initialization attempt completed", "arg0=1 success/0 failure; arg1=DHCP or failure reason"),
+}
+
+EVENT_CATEGORIES = ("all", "system", "alarm", "valve", "wifi", "ethernet", "adc", "gpio", "rs485")
 
 
 def _convert_scalar(value: str) -> object:
@@ -186,6 +210,8 @@ class RttSession:
         self.connection: Optional[socket.socket] = None
         self._log = None
         self._send_lock = threading.Lock()
+        self._log_line_buffer = ""
+        self._secret_log_suppressed = False
 
     def start(self) -> None:
         if self.thread is not None and self.thread.is_alive():
@@ -238,9 +264,31 @@ class RttSession:
             self._log.close()
             self._log = None
 
-    def _write_log(self, data: bytes) -> None:
-        if self._log is not None:
-            self._log.write(data)
+    def _write_log(self, text: str) -> None:
+        """Write RTT text while never persisting Admin-only credentials."""
+        if self._log is None:
+            return
+        self._log_line_buffer += text
+        lines = self._log_line_buffer.splitlines(keepends=True)
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            self._log_line_buffer = lines.pop()
+        else:
+            self._log_line_buffer = ""
+        output: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            marker = stripped
+            if marker.startswith(PROMPT.strip()):
+                marker = marker[len(PROMPT.strip()):].strip()
+            if marker == "secrets_begin":
+                self._secret_log_suppressed = True
+                output.append("[ADMIN CREDENTIAL RESPONSE REDACTED]\r\n")
+            elif marker == "secrets_end":
+                self._secret_log_suppressed = False
+            elif not self._secret_log_suppressed:
+                output.append(line)
+        if output:
+            self._log.write("".join(output).encode("utf-8", errors="replace"))
             self._log.flush()
 
     def _run(self) -> None:
@@ -272,8 +320,8 @@ class RttSession:
                             continue
                         if not data:
                             raise ConnectionError("RTT server closed the connection")
-                        self._write_log(data)
                         text = decoder.decode(data)
+                        self._write_log(text)
                         self._emit("text", text)
                         if self.analyzer is not None:
                             for message in self.analyzer.feed(text):
@@ -412,10 +460,9 @@ class LiveChart(ttk.Frame):
 
 
 class GasChangerGui(tk.Tk):
-    POLL_COMMANDS = (
-        "status", "sensor", "valve detail", "alarm", "wifi detail",
-        "ethernet", "rtos", "io", "rs485", "watchdog", "config",
-        "fault", "stats", "admin status",
+    SLOW_POLL_COMMANDS = (
+        "wifi detail", "ethernet", "rtos", "io", "rs485", "watchdog",
+        "config all", "fault", "stats", "admin status",
     )
 
     def __init__(self, args: argparse.Namespace) -> None:
@@ -431,11 +478,27 @@ class GasChangerGui(tk.Tk):
         self.openocd = OpenOcdManager(self.tool_directory)
         self.connected = False
         self.raw_buffer = ""
+        self.prompt_probe = ""
+        self.secret_wire_buffer = ""
+        self.secret_capture_active = False
+        self.secret_payload: dict[str, object] = {}
         self.history: list[str] = []
         self.history_index = 0
-        self.last_poll = 0.0
+        self.last_fast_poll = 0.0
+        self.last_slow_poll = 0.0
         self.poll_index = 0
-        self.poll_interval = tk.DoubleVar(value=args.poll_interval)
+        self.poll_interval = tk.DoubleVar(value=max(0.2, args.poll_interval))
+        self.slow_poll_interval = tk.DoubleVar(value=1.0)
+        self.effective_fast_interval = max(0.2, args.poll_interval)
+        self.last_output_drops = 0
+        self.command_pending = False
+        self.boot_time_anchor: Optional[float] = None
+        self.boot_anchors: dict[int, float] = {}
+        self.event_response_boot = 0
+        self.event_records: list[dict[str, object]] = []
+        self.event_record_by_iid: dict[str, dict[str, object]] = {}
+        self.fault_records: list[dict[str, object]] = []
+        self.last_fault_identity: tuple[object, ...] | None = None
         self.host = tk.StringVar(value=args.host)
         self.port = tk.IntVar(value=args.port)
         self.connection_text = tk.StringVar(value="Disconnected")
@@ -509,12 +572,14 @@ class GasChangerGui(tk.Tk):
         definitions = (
             ("Service", "service"), ("Valve", "valve"), ("Alarm", "alarm"),
             ("Left pressure", "left"), ("Right pressure", "right"), ("Outlet", "out"),
+            ("Left gas", "left_gas"), ("Right gas", "right_gas"),
+            ("Left ECO", "left_eco"), ("Right ECO", "right_eco"),
             ("Wi-Fi", "wifi"), ("Ethernet", "ethernet"),
         )
         for index, (title, key) in enumerate(definitions):
             frame = ttk.LabelFrame(cards, text=title, padding=10)
-            frame.grid(row=index // 4, column=index % 4, sticky="nsew", padx=4, pady=4)
-            cards.columnconfigure(index % 4, weight=1)
+            frame.grid(row=index // 6, column=index % 6, sticky="nsew", padx=4, pady=4)
+            cards.columnconfigure(index % 6, weight=1)
             variable = tk.StringVar(value="-")
             self.card_vars[key] = variable
             ttk.Label(frame, textvariable=variable, style="CardValue.TLabel").pack()
@@ -575,37 +640,56 @@ class GasChangerGui(tk.Tk):
     def _build_events(self) -> None:
         toolbar = ttk.Frame(self.events_tab)
         toolbar.pack(fill="x", pady=(0, 8))
-        ttk.Button(toolbar, text="Refresh 32", command=lambda: self.send_command("events 32")).pack(side="left")
+        ttk.Label(toolbar, text="Category").pack(side="left")
+        self.event_category = tk.StringVar(value="all")
+        ttk.Combobox(toolbar, textvariable=self.event_category, values=EVENT_CATEGORIES,
+                     state="readonly", width=12).pack(side="left", padx=6)
+        ttk.Button(toolbar, text="Refresh 32", command=self._refresh_events).pack(side="left")
         ttk.Button(toolbar, text="Read fault", command=lambda: self.send_command("fault")).pack(side="left", padx=6)
         ttk.Button(toolbar, text="Read version", command=lambda: self.send_command("version")).pack(side="left")
-        columns = ("tick", "code", "name", "arg0", "arg1")
-        self.event_tree = ttk.Treeview(self.events_tab, columns=columns, show="headings", height=13)
+        ttk.Button(toolbar, text="Clear view", command=self._clear_events_faults).pack(side="right")
+        ttk.Button(toolbar, text="Export", command=self._export_events_faults).pack(side="right", padx=6)
+        event_pane = ttk.Panedwindow(self.events_tab, orient="horizontal")
+        event_pane.pack(fill="both", expand=True)
+        event_list = ttk.Frame(event_pane)
+        event_detail = ttk.LabelFrame(event_pane, text="Selected event meaning", padding=6)
+        event_pane.add(event_list, weight=3)
+        event_pane.add(event_detail, weight=2)
+        columns = ("pc_time", "category", "name", "summary", "tick", "seq")
+        self.event_tree = ttk.Treeview(event_list, columns=columns, show="headings", height=13)
+        headings = {"pc_time": "PC TIME", "category": "CATEGORY", "name": "EVENT",
+                    "summary": "SUMMARY", "tick": "DEVICE ms", "seq": "SEQ"}
         for column in columns:
-            self.event_tree.heading(column, text=column.upper())
-        self.event_tree.column("tick", width=110)
-        self.event_tree.column("code", width=70)
-        self.event_tree.column("name", width=180)
-        self.event_tree.column("arg0", width=140)
-        self.event_tree.column("arg1", width=140)
+            self.event_tree.heading(column, text=headings[column])
+        self.event_tree.column("pc_time", width=175)
+        self.event_tree.column("category", width=90)
+        self.event_tree.column("name", width=160)
+        self.event_tree.column("summary", width=260)
+        self.event_tree.column("tick", width=90, anchor="e")
+        self.event_tree.column("seq", width=65, anchor="e")
         self.event_tree.pack(fill="both", expand=True)
+        self.event_tree.bind("<<TreeviewSelect>>", self._show_event_detail)
+        self.event_detail_text = ScrolledText(event_detail, width=38, height=12,
+                                              font=("Segoe UI", 10), wrap="word")
+        self.event_detail_text.pack(fill="both", expand=True)
         fault_frame = ttk.LabelFrame(self.events_tab, text="Fault analysis", padding=5)
         fault_frame.pack(fill="both", expand=True, pady=(10, 0))
         self.fault_text = ScrolledText(fault_frame, height=9, font=("Consolas", 10), wrap="word")
         self.fault_text.pack(fill="both", expand=True)
 
     def _build_console(self) -> None:
-        self.console = ScrolledText(self.console_tab, bg="#0d1117", fg="#c9d1d9", insertbackground="white", font=("Consolas", 10), wrap="word")
-        self.console.pack(fill="both", expand=True)
         command_frame = ttk.Frame(self.console_tab)
-        command_frame.pack(fill="x", pady=(7, 0))
-        ttk.Label(command_frame, text="GasChanger>").pack(side="left")
+        command_frame.pack(fill="x", pady=(0, 7))
+        ttk.Label(command_frame, text="Command", style="Status.TLabel").pack(side="left")
         self.command_entry = ttk.Entry(command_frame)
         self.command_entry.pack(side="left", fill="x", expand=True, padx=6)
         self.command_entry.bind("<Return>", lambda _event: self._send_console())
         self.command_entry.bind("<Up>", lambda _event: self._history(-1))
         self.command_entry.bind("<Down>", lambda _event: self._history(1))
-        ttk.Button(command_frame, text="Send", command=self._send_console).pack(side="left")
-        ttk.Button(command_frame, text="Clear", command=lambda: self.console.delete("1.0", "end")).pack(side="left", padx=(6, 0))
+        ttk.Button(command_frame, text="Send ↵", command=self._send_console).pack(side="left")
+        ttk.Button(command_frame, text="Clear console", command=lambda: self.console.delete("1.0", "end")).pack(side="left", padx=(6, 0))
+        self.console = ScrolledText(self.console_tab, bg="#0d1117", fg="#c9d1d9", insertbackground="white", font=("Consolas", 10), wrap="word")
+        self.console.pack(fill="both", expand=True)
 
     def _build_controls(self) -> None:
         warning = ttk.Label(
@@ -626,6 +710,8 @@ class GasChangerGui(tk.Tk):
         password_entry.bind("<Return>", lambda _event: self._admin_login())
         ttk.Button(login, text="Unlock", command=self._admin_login).pack(side="left")
         ttk.Button(login, text="Lock", command=lambda: self.send_command("admin logout")).pack(side="left", padx=6)
+        ttk.Button(login, text="View network credentials",
+                   command=lambda: self.send_command("config secrets")).pack(side="left", padx=6)
         ttk.Label(login, textvariable=self.admin_state, style="Status.TLabel").pack(side="right")
         actions = ttk.LabelFrame(self.control_tab, text="Board operations", padding=12)
         actions.pack(fill="x", pady=12)
@@ -652,9 +738,11 @@ class GasChangerGui(tk.Tk):
         ttk.Entry(connection, textvariable=self.host, width=18).grid(row=0, column=1, padx=6)
         ttk.Label(connection, text="Port").grid(row=0, column=2, sticky="w")
         ttk.Entry(connection, textvariable=self.port, width=8).grid(row=0, column=3, padx=6)
-        ttk.Label(connection, text="Poll interval (s)").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Spinbox(connection, from_=0.25, to=10.0, increment=0.25, textvariable=self.poll_interval, width=8).grid(row=1, column=1, sticky="w", padx=6, pady=(8, 0))
-        ttk.Checkbutton(connection, text="Automatic polling", variable=self.auto_poll).grid(row=1, column=2, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(connection, text="Telemetry interval (s)").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Spinbox(connection, from_=0.2, to=2.0, increment=0.1, textvariable=self.poll_interval, width=8).grid(row=1, column=1, sticky="w", padx=6, pady=(8, 0))
+        ttk.Label(connection, text="Diagnostic interval (s)").grid(row=1, column=2, sticky="w", pady=(8, 0))
+        ttk.Spinbox(connection, from_=0.5, to=10.0, increment=0.5, textvariable=self.slow_poll_interval, width=8).grid(row=1, column=3, sticky="w", padx=6, pady=(8, 0))
+        ttk.Checkbutton(connection, text="Automatic polling", variable=self.auto_poll).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
         logging = ttk.LabelFrame(self.settings_tab, text="Session logging", padding=10)
         logging.pack(fill="x", pady=10)
         ttk.Entry(logging, textvariable=self.log_path).pack(side="left", fill="x", expand=True)
@@ -665,7 +753,7 @@ class GasChangerGui(tk.Tk):
             info,
             text="• OpenOCD hot-attaches through SWD without reset, halt, flash or program commands.\n"
                  "• The GUI reconnects after a board reboot and verifies fault symbols against the exact Build ID.\n"
-                 "• Live Watch polls one bounded read-only command at a time so firmware tasks are not suspended.\n"
+                 "• Fast compact telemetry and slower diagnostics are polled separately; RTT drop reports automatically reduce the fast rate.\n"
                  "• Closing the GUI terminates only the OpenOCD process started by this GUI.",
             justify="left",
         ).pack(anchor="nw")
@@ -688,6 +776,10 @@ class GasChangerGui(tk.Tk):
             self.session.send_immediate("admin logout")
             self.session.stop()
             self.session = None
+        self.command_pending = False
+        self.secret_capture_active = False
+        self.secret_payload = {}
+        self.admin_state.set("Locked")
         self._set_connection(False)
 
     def send_command(self, command: str, show_outbound: bool = True) -> None:
@@ -696,6 +788,7 @@ class GasChangerGui(tk.Tk):
             return
         if show_outbound:
             self._append_console(f"\n> {command}\n", "outbound")
+        self.command_pending = True
         self.session.send(command)
 
     def _set_connection(self, connected: bool) -> None:
@@ -741,7 +834,103 @@ class GasChangerGui(tk.Tk):
         self._refresh_watch()
         self.after(60, self._drain_events)
 
+    @staticmethod
+    def _decode_hex_text(value: object) -> str:
+        try:
+            return bytes.fromhex(str(value)).decode("utf-8", errors="replace")
+        except ValueError:
+            return "<invalid encoding>"
+
+    def _filter_secret_response(self, text: str) -> str:
+        """Capture credentials for a modal and keep them out of the console."""
+        self.secret_wire_buffer += text
+        lines = self.secret_wire_buffer.splitlines(keepends=True)
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            self.secret_wire_buffer = lines.pop()
+        else:
+            self.secret_wire_buffer = ""
+        visible: list[str] = []
+        for line in lines:
+            clean = line.strip()
+            if clean.startswith(PROMPT):
+                clean = clean[len(PROMPT):].strip()
+            if clean == "secrets_begin":
+                self.secret_capture_active = True
+                self.secret_payload = {}
+            elif clean == "secrets_end":
+                self.secret_capture_active = False
+                station = self.secret_payload.get("secret_station", {})
+                softap = self.secret_payload.get("secret_softap", {})
+                messagebox.showinfo(
+                    "Network credentials (Admin)",
+                    "Station SSID: " + self._decode_hex_text(station.get("ssid_hex", "")) +
+                    "\nStation password: " + self._decode_hex_text(station.get("password_hex", "")) +
+                    "\n\nSoftAP SSID: " + self._decode_hex_text(softap.get("ssid_hex", "")) +
+                    "\nSoftAP password: " + self._decode_hex_text(softap.get("password_hex", "")) +
+                    "\n\nThis response was not written to the console or session log.",
+                )
+                self.secret_payload = {}
+            elif self.secret_capture_active:
+                namespace = line_namespace(clean)
+                if namespace.startswith("secret_"):
+                    self.secret_payload[namespace] = {
+                        key: raw for key, raw in TOKEN_RE.findall(clean)
+                    }
+            else:
+                visible.append(line)
+        return "".join(visible)
+
+    def _update_boot_anchor(self, device_now_ms: object, boot: object = None) -> None:
+        if not isinstance(device_now_ms, (int, float)):
+            return
+        candidate = time.time() - float(device_now_ms) / 1000.0
+        if self.boot_time_anchor is None or abs(candidate - self.boot_time_anchor) > 2.0:
+            self.boot_time_anchor = candidate
+        else:
+            self.boot_time_anchor = self.boot_time_anchor * 0.9 + candidate * 0.1
+
+        if isinstance(boot, int):
+            self.boot_anchors[boot] = self.boot_time_anchor
+
+    def _pc_time_for_tick(self, tick: int, boot: Optional[int] = None) -> str:
+        anchor = self.boot_anchors.get(boot, self.boot_time_anchor) if boot is not None else self.boot_time_anchor
+        if anchor is None:
+            return datetime.now().astimezone().isoformat(timespec="milliseconds")
+        return datetime.fromtimestamp(anchor + tick / 1000.0).astimezone().isoformat(timespec="milliseconds")
+
+    def _add_event_line(self, line: str, match: re.Match[str]) -> None:
+        tick_text, code_text, name, arg0, arg1 = match.groups()
+        fields = parse_key_values(line)
+        tick = int(tick_text)
+        sequence = int(fields.get("seq", 0))
+        category = str(fields.get("category", "UNKNOWN"))
+        identity = (f"event-{self.event_response_boot}-{sequence}" if sequence else
+                    f"event-{self.event_response_boot}-{tick_text}-{code_text}-{arg0}-{arg1}")
+        if self.event_tree.exists(identity):
+            return
+        title, argument_help = EVENT_DETAILS.get(name, ("Firmware diagnostic event", "See firmware release notes for argument semantics"))
+        record = {
+            "pc_time": self._pc_time_for_tick(tick, self.event_response_boot),
+            "pc_time_basis": "device tick synchronized to PC",
+            "device_tick_ms": tick,
+            "boot": self.event_response_boot, "sequence": sequence,
+            "code": int(code_text), "category": category,
+            "name": name, "summary": title, "argument0": arg0, "argument1": arg1,
+            "meaning": argument_help,
+        }
+        self.event_records.append(record)
+        self.event_record_by_iid[identity] = record
+        self.event_tree.insert("", 0, iid=identity, values=(record["pc_time"], category,
+            name, title, tick, sequence))
+
     def _process_text(self, text: str) -> None:
+        prompt_stream = self.prompt_probe + text
+        if PROMPT in prompt_stream:
+            self.command_pending = False
+        self.prompt_probe = prompt_stream[-(len(PROMPT) - 1):]
+        text = self._filter_secret_response(text)
+        if not text:
+            return
         self._append_console(text)
         self.raw_buffer += text.replace(PROMPT, "")
         lines = self.raw_buffer.splitlines(keepends=True)
@@ -754,15 +943,44 @@ class GasChangerGui(tk.Tk):
             if not line:
                 continue
             self.telemetry.update_line(line)
+            values = parse_key_values(line)
+            if line.startswith("telemetry "):
+                self._update_boot_anchor(values.get("now_ms"), values.get("boot"))
+                pressure = [values.get("left_pressure_tenths"),
+                            values.get("right_pressure_tenths"),
+                            values.get("out_pressure_tenths")]
+                adc = [values.get("left_adc"), values.get("right_adc"), values.get("out_adc")]
+                if all(isinstance(item, int) for item in pressure + adc):
+                    self.telemetry.update_line(
+                        f"sensor pressure_tenths=[{pressure[0]},{pressure[1]},{pressure[2]}] "
+                        f"dma_raw=[{adc[0]},{adc[1]},{adc[2]}]"
+                    )
+            elif line.startswith("events "):
+                self._update_boot_anchor(values.get("device_now_ms"), values.get("boot"))
+                if isinstance(values.get("boot"), int):
+                    self.event_response_boot = int(values["boot"])
             event_match = EVENT_RE.search(line)
             if event_match:
-                values = event_match.groups()
-                identity = f"{values[0]}-{values[1]}-{values[3]}-{values[4]}"
-                if not self.event_tree.exists(identity):
-                    self.event_tree.insert("", 0, iid=identity, values=values)
-            if line.startswith("fault"):
-                self.fault_text.insert("end", line + "\n")
-                self.fault_text.see("end")
+                self._add_event_line(line, event_match)
+            if line.startswith("fault "):
+                fault_boot = values.get("fault_boot")
+                snapshot_tick = values.get("fault_snapshot_tick")
+                if isinstance(fault_boot, int) and isinstance(snapshot_tick, int) and fault_boot in self.boot_anchors:
+                    fault_pc_time = self._pc_time_for_tick(snapshot_tick, fault_boot)
+                    time_basis = "fault tick synchronized while PC was connected"
+                else:
+                    fault_pc_time = datetime.now().astimezone().isoformat(timespec="milliseconds")
+                    time_basis = "PC observation time (fault boot was not synchronized)"
+                record = {"pc_time": fault_pc_time, "pc_time_basis": time_basis,
+                          "data": values, "raw": line}
+                fault_identity = (values.get("fault_boot"), values.get("count"),
+                                  values.get("type"), values.get("fault_build_id"))
+                if fault_identity != self.last_fault_identity:
+                    self.last_fault_identity = fault_identity
+                    self.fault_records.append(record)
+                    self.fault_text.insert("end", f"[{record['pc_time']}] ({record['pc_time_basis']})\n")
+                    self.fault_text.insert("end", line + "\n")
+                    self.fault_text.see("end")
             if line.startswith("OK admin unlocked"):
                 self.admin_state.set("Unlocked (5 min)")
                 self.admin_password.set("")
@@ -774,21 +992,49 @@ class GasChangerGui(tk.Tk):
 
     def _poll_tick(self) -> None:
         now = time.monotonic()
-        if self.connected and self.auto_poll.get() and now - self.last_poll >= max(0.25, self.poll_interval.get()):
-            self.send_command(self.POLL_COMMANDS[self.poll_index], show_outbound=False)
-            self.poll_index = (self.poll_index + 1) % len(self.POLL_COMMANDS)
-            self.last_poll = now
+        drops = self.telemetry.get("stats.output_drops", 0)
+        if isinstance(drops, int) and drops > self.last_output_drops:
+            self.effective_fast_interval = min(max(self.effective_fast_interval * 1.5, 0.3), 2.0)
+            self._append_notice(
+                f"RTT output drops increased ({self.last_output_drops} → {drops}); "
+                f"telemetry interval backed off to {self.effective_fast_interval:.2f}s"
+            )
+            self.last_output_drops = drops
+        requested_fast = max(0.2, self.poll_interval.get())
+        if drops == self.last_output_drops and self.effective_fast_interval > requested_fast:
+            self.effective_fast_interval = max(requested_fast, self.effective_fast_interval - 0.01)
+        if self.connected and self.auto_poll.get() and not self.command_pending:
+            if now - self.last_slow_poll >= max(0.5, self.slow_poll_interval.get()):
+                self.send_command(self.SLOW_POLL_COMMANDS[self.poll_index], show_outbound=False)
+                self.poll_index = (self.poll_index + 1) % len(self.SLOW_POLL_COMMANDS)
+                self.last_slow_poll = now
+            elif now - self.last_fast_poll >= self.effective_fast_interval:
+                self.send_command("telemetry", show_outbound=False)
+                self.last_fast_poll = now
         self.after(100, self._poll_tick)
 
     def _refresh_dashboard(self) -> None:
         get = self.telemetry.get
-        self.card_vars["service"].set(str(get("status.service")))
+        service = get("telemetry.service", get("status.service"))
+        self.card_vars["service"].set(str(service))
         self.card_vars["valve"].set(f"{get('valve.output')} / {get('valve.feedback')}")
-        alarm = get("status.alarm")
+        alarm = get("telemetry.alarm", get("status.alarm"))
         self.card_vars["alarm"].set(f"0x{alarm:08X}" if isinstance(alarm, int) else str(alarm))
         for key, index in (("left", 0), ("right", 1), ("out", 2)):
-            value = get(f"sensor.pressure_tenths[{index}]")
+            fast_path = {0: "telemetry.left_pressure_tenths",
+                         1: "telemetry.right_pressure_tenths",
+                         2: "telemetry.out_pressure_tenths"}[index]
+            value = get(fast_path, get(f"sensor.pressure_tenths[{index}]"))
             self.card_vars[key].set(f"{value / 10.0:.1f}" if isinstance(value, (int, float)) else str(value))
+        self.card_vars["left_gas"].set(str(get("telemetry.left_gas")))
+        self.card_vars["right_gas"].set(str(get("telemetry.right_gas")))
+        for side in ("left", "right"):
+            seconds = get(f"telemetry_eco.{side}_remaining_s")
+            if isinstance(seconds, int):
+                eco_text = f"{seconds // 60:02d}:{seconds % 60:02d}"
+            else:
+                eco_text = str(seconds)
+            self.card_vars[f"{side}_eco"].set(eco_text)
         self.card_vars["wifi"].set("UP" if get("wifi.link", 0) == 1 else "DOWN")
         self.card_vars["ethernet"].set("UP" if get("ethernet.phy", 0) == 1 else "DOWN")
         health = (
@@ -862,6 +1108,72 @@ class GasChangerGui(tk.Tk):
                 for timestamp, value in self.watch_history[definition.path]:
                     writer.writerow((datetime.fromtimestamp(timestamp).isoformat(), definition.label, definition.path, value, definition.unit))
 
+    def _refresh_events(self) -> None:
+        self.send_command(f"events {self.event_category.get()} 32")
+
+    def _show_event_detail(self, _event: object = None) -> None:
+        selection = self.event_tree.selection()
+        if not selection:
+            return
+        record = self.event_record_by_iid.get(selection[0])
+        if record is None:
+            return
+        detail = (
+            f"PC time: {record['pc_time']}\n"
+            f"Category: {record['category']}\n"
+            f"Boot: {record['boot']}\n"
+            f"Event: {record['name']} (code {record['code']})\n"
+            f"Device tick: {record['device_tick_ms']} ms\n"
+            f"Sequence: {record['sequence']}\n\n"
+            f"Meaning\n{record['summary']}\n\n"
+            f"Arguments\n{record['meaning']}\n"
+            f"arg0={record['argument0']}\narg1={record['argument1']}"
+        )
+        self.event_detail_text.delete("1.0", "end")
+        self.event_detail_text.insert("1.0", detail)
+
+    def _clear_events_faults(self) -> None:
+        if not messagebox.askyesno(
+            "Clear diagnostic view",
+            "Clear events and faults shown on this PC?\n\n"
+            "The retained records inside the controller will not be erased.",
+        ):
+            return
+        for item in self.event_tree.get_children():
+            self.event_tree.delete(item)
+        self.event_records.clear()
+        self.event_record_by_iid.clear()
+        self.fault_records.clear()
+        self.last_fault_identity = None
+        self.event_detail_text.delete("1.0", "end")
+        self.fault_text.delete("1.0", "end")
+
+    def _export_events_faults(self) -> None:
+        path = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("CSV", "*.csv")],
+        )
+        if not path:
+            return
+        output_path = Path(path)
+        if output_path.suffix.lower() == ".csv":
+            with output_path.open("w", newline="", encoding="utf-8-sig") as output:
+                writer = csv.writer(output)
+                writer.writerow(("record_type", "pc_time", "boot", "category", "name", "summary",
+                                 "device_tick_ms", "sequence", "arg0", "arg1", "details"))
+                for event in self.event_records:
+                    writer.writerow(("event", event["pc_time"], event["boot"], event["category"], event["name"],
+                                     event["summary"], event["device_tick_ms"], event["sequence"],
+                                     event["argument0"], event["argument1"], event["meaning"]))
+                for fault in self.fault_records:
+                    writer.writerow(("fault", fault["pc_time"], fault["data"].get("boot", ""), "FAULT", "FAULT", fault["raw"],
+                                     fault["data"].get("fault_snapshot_tick", ""), "", "", "", fault["pc_time_basis"]))
+        else:
+            payload = {"exported_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                       "events": self.event_records, "faults": self.fault_records}
+            output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._append_notice(f"Diagnostics exported: {output_path}")
+
     def _send_console(self) -> None:
         command = self.command_entry.get().strip()
         self.command_entry.delete(0, "end")
@@ -918,7 +1230,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="GasChanger RTT GUI")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9090)
-    parser.add_argument("--poll-interval", type=float, default=0.75)
+    parser.add_argument("--poll-interval", type=float, default=0.25)
     parser.add_argument("--log", type=Path)
     parser.add_argument("--elf", type=Path)
     parser.add_argument("--symbols", type=Path)
