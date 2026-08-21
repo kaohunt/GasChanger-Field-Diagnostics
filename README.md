@@ -5,7 +5,7 @@ ELF, HEX, BIN, MAP 및 펌웨어 소스는 이 저장소에 포함하지 않습�
 
 ## 공개 내용
 
-- `app/`: 조회 전용 RTT 터미널
+- `app/`: GUI 및 명령행 RTT 현장진단 도구
 - `symbols/`: Build ID별 최소 함수 주소 패키지와 Ed25519 서명
 - `app/trusted_symbol_public.pem`: 심볼 서명 검증 공개키
 
@@ -23,6 +23,16 @@ ELF, HEX, BIN, MAP 및 펌웨어 소스는 이 저장소에 포함하지 않습�
 ## 실행
 
 PowerShell에서 다음을 실행합니다.
+
+```powershell
+.\app\start_rtt_gui.ps1
+```
+
+GUI는 Dashboard, Live Watch 그래프/CSV, 전체 진단값, 이벤트, Fault 심볼 분석,
+원시 콘솔과 세션 로그를 한 화면에서 제공합니다. 연결이 끊기거나 보드가 재부팅되면
+자동으로 재접속합니다.
+
+명령행 터미널을 사용하려면 다음을 실행합니다.
 
 ```powershell
 .\app\start_rtt_terminal.ps1
@@ -47,6 +57,11 @@ Fault 기록 및 심볼 패키지의 Build ID가 모두 일치할 때만 PC/LR�
 
 OpenOCD는 `127.0.0.1`에만 RTT 포트를 열며 GDB/TCL/Telnet과 reset/halt/program/Flash
 명령을 사용하지 않습니다. 도구 사용 조건은 [LICENSE.md](LICENSE.md)를 확인하십시오.
+
+FW 3.1.2 이상에서 밸브, 부저, 램프, 통신 송신 및 MCU 재부팅 제어는 FW가 직접
+Admin 암호를 검증한 뒤에만 활성화됩니다. 암호 원문은 공개 저장소, GUI 파일 및
+세션 로그에 포함되지 않습니다. 밸브 제어 전에는 반드시 가스 공급계통이 안전한지
+확인하십시오. 설정/교정값은 GUI에서 변경할 수 없습니다.
 
 ## 현재 공개 심볼
 
