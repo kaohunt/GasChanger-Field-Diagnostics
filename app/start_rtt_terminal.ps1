@@ -35,6 +35,7 @@ if(($ElfPath -eq '') -and ($SymbolPath -eq '')) {
     )
     $ElfPath = $defaultElfCandidates | Where-Object { Test-Path -LiteralPath $_ } |
         Select-Object -First 1
+    if($null -eq $ElfPath) { $ElfPath = '' }
 }
 $symbolCache = Join-Path $env:LOCALAPPDATA 'GasChanger\symbols'
 if(($SymbolUrl -eq '') -and ($null -ne $env:GASCHANGER_SYMBOL_URL)) {
