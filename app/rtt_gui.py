@@ -197,7 +197,9 @@ def decode_bitmask(value: object, definitions: tuple[tuple[int, str], ...], zero
     unknown = value & ~known_mask
     if unknown:
         names.append(f"미정의 비트 0x{unknown:08X}")
-    return f"{' | '.join(names) if names else zero} (0x{value:08X})"
+    lines = names if names else [zero]
+    lines.append(f"원시값 0x{value:08X}")
+    return "\n".join(lines)
 
 
 def decode_enum(value: object, labels: dict[int, str]) -> str:
@@ -224,6 +226,11 @@ def format_metric(path: str, value: object) -> str:
     return str(value)
 
 
+def format_metric_compact(path: str, value: object) -> str:
+    """Keep table cells single-line while preserving every decoded item."""
+    return " · ".join(part for part in format_metric(path, value).splitlines() if part)
+
+
 def _hex_int(value: object) -> int:
     try:
         return int(str(value), 16) if str(value).lower().startswith("0x") else int(str(value))
@@ -237,30 +244,38 @@ def interpret_event_arguments(name: str, arg0: object, arg1: object) -> str:
     direction = {0: "UNKNOWN", 1: "LEFT", 2: "RIGHT"}
     link = {0: "연결 끊김", 1: "연결됨", 0xFF: "초기값/알 수 없음"}
     if name == "BOOT":
-        return f"부팅 횟수={first}; 리셋 원인={decode_bitmask(second, RESET_FLAG_BITS)}"
+        return f"부팅 횟수\n{first}\n\n리셋 원인\n{decode_bitmask(second, RESET_FLAG_BITS)}"
     if name == "ALARM_CHANGE":
-        return f"이전={decode_bitmask(first, ALARM_BITS)}\n현재={decode_bitmask(second, ALARM_BITS)}"
+        return f"이전 알람\n{decode_bitmask(first, ALARM_BITS)}\n\n현재 알람\n{decode_bitmask(second, ALARM_BITS)}"
     if name in ("WIFI_LINK", "ETH_LINK"):
-        return f"이전={link.get(first, f'알 수 없음({first})')} → 현재={link.get(second, f'알 수 없음({second})')}"
+        return (f"이전 상태\n{link.get(first, f'알 수 없음 ({first})')}\n\n"
+                f"현재 상태\n{link.get(second, f'알 수 없음 ({second})')}\n\n"
+                f"원시값\n{first} → {second}")
     if name in ("VALVE_REQUEST", "VALVE_FEEDBACK"):
-        return f"방향={direction.get(first, f'알 수 없음({first})')}; 요청 방향={direction.get(second, f'알 수 없음({second})')}"
+        return (f"감지 방향\n{direction.get(first, f'알 수 없음 ({first})')}\n\n"
+                f"요청 방향\n{direction.get(second, f'알 수 없음 ({second})')}")
     if name == "VALVE_OUTPUT":
-        return f"구동 방향={direction.get(first, f'알 수 없음({first})')}; GPIO 출력 마스크=0x{second:08X}"
+        return (f"구동 방향\n{direction.get(first, f'알 수 없음 ({first})')}\n\n"
+                f"GPIO 출력 마스크\n0x{second:08X}")
     if name in ("CHECK_SET", "CHECK_CLEAR"):
-        return f"CHECK={decode_bitmask(first, CHECK_BITS)}\n전체 CHECK={decode_bitmask(second, CHECK_BITS)}"
+        return (f"변경된 CHECK\n{decode_bitmask(first, CHECK_BITS)}\n\n"
+                f"전체 CHECK\n{decode_bitmask(second, CHECK_BITS)}")
     if name == "SWITCH_BEGIN":
-        return f"전환 목표={direction.get(first, f'알 수 없음({first})')}; 통신 대기={decode_bitmask(second, VALVE_EVENT_PATH_BITS)}"
+        return (f"전환 목표\n{direction.get(first, f'알 수 없음 ({first})')}\n\n"
+                f"통신 대기\n{decode_bitmask(second, VALVE_EVENT_PATH_BITS)}")
     if name == "SWITCH_DONE":
-        return f"완료 경로={decode_bitmask(first, VALVE_EVENT_PATH_BITS)}; 실패 경로={decode_bitmask(second, VALVE_EVENT_PATH_BITS)}"
+        return (f"완료 경로\n{decode_bitmask(first, VALVE_EVENT_PATH_BITS)}\n\n"
+                f"실패 경로\n{decode_bitmask(second, VALVE_EVENT_PATH_BITS)}")
     if name == "ADC_VALID_CHANGE":
-        return f"이전={decode_bitmask(first, ADC_VALID_BITS)}\n현재={decode_bitmask(second, ADC_VALID_BITS)}"
+        return (f"이전 ADC 상태\n{decode_bitmask(first, ADC_VALID_BITS)}\n\n"
+                f"현재 ADC 상태\n{decode_bitmask(second, ADC_VALID_BITS)}")
     if name == "GPIO_HEALTH":
-        return f"GPIO 상태={'정상/복구' if first else '통신 이상'}; 진단 카운터={second}"
+        return f"GPIO 상태\n{'정상/복구' if first else '통신 이상'}\n\n진단 카운터\n{second}"
     if name == "GPIO_RECOVERY":
-        return f"복구 결과={'성공' if first else '실패'}; 재초기화 횟수={second}"
+        return f"복구 결과\n{'성공' if first else '실패'}\n\n재초기화 횟수\n{second}"
     if name == "ETH_INIT":
-        return f"초기화={'성공' if first else '실패'}; DHCP/실패 사유 코드={second}"
-    return f"arg0=0x{first:08X} ({first}); arg1=0x{second:08X} ({second})"
+        return f"초기화\n{'성공' if first else '실패'}\n\nDHCP/실패 사유 코드\n{second}"
+    return f"arg0\n0x{first:08X} ({first})\n\narg1\n0x{second:08X} ({second})"
 
 
 def _convert_scalar(value: str) -> object:
@@ -695,14 +710,18 @@ class GasChangerGui(tk.Tk):
         self.fault_detail_signatures: set[tuple[object, ...]] = set()
         self.console_paused = tk.BooleanVar(value=False)
         self.console_auto_pause = tk.BooleanVar(value=True)
-        self.console_pause_text = tk.StringVar(value="Pause display")
-        self.console_pause_status = tk.StringVar(value="LIVE · background capture active")
+        self.console_pause_text = tk.StringVar(value="표시 일시정지")
+        self.console_pause_status = tk.StringVar(value="LIVE · 백그라운드 수집 중")
         self.console_pause_buffer: deque[tuple[str, Optional[str]]] = deque(maxlen=4096)
         self.console_pause_dropped = 0
         self.console_pause_reason = ""
         self.firmware_identity = tk.StringVar(value="Not read — press Read version")
         self.firmware_build_detail = tk.StringVar(value="Build/source details will appear here")
         self.firmware_source_detail = tk.StringVar(value="")
+        self.header_fw_text = tk.StringVar(value="FW 미확인")
+        self.header_check_text = tk.StringVar(value="CHECK 정상")
+        self.header_admin_text = tk.StringVar(value="Admin 잠금")
+        self.header_pause_text = tk.StringVar(value="수집 LIVE")
         self.host = tk.StringVar(value=args.host)
         self.port = tk.IntVar(value=args.port)
         self.connection_text = tk.StringVar(value="Disconnected")
@@ -732,9 +751,13 @@ class GasChangerGui(tk.Tk):
         if "vista" in style.theme_names():
             style.theme_use("vista")
         style.configure("Status.TLabel", font=("Segoe UI", 10, "bold"))
+        style.configure("Header.TLabel", font=("Segoe UI", 9, "bold"), foreground="#30363d")
+        style.configure("HeaderMuted.TLabel", font=("Segoe UI", 9), foreground="#57606a")
+        style.configure("Check.TLabel", font=("Segoe UI", 9, "bold"), foreground="#b54708")
         style.configure("CardValue.TLabel", font=("Segoe UI", 19, "bold"))
         style.configure("CardTitle.TLabel", foreground="#57606a")
         style.configure("Danger.TButton", foreground="#a40e26")
+        style.configure("Warning.TButton", foreground="#b54708")
 
     def _build_ui(self) -> None:
         top = ttk.Frame(self, padding=(10, 8))
@@ -744,40 +767,96 @@ class GasChangerGui(tk.Tk):
         self.status_dot.pack(side="left", padx=(18, 4))
         self._set_connection(False)
         ttk.Label(top, textvariable=self.connection_text, style="Status.TLabel").pack(side="left")
-        ttk.Button(top, text="Connect", command=self.connect).pack(side="right")
-        ttk.Button(top, text="Disconnect", command=self.disconnect).pack(side="right", padx=6)
-        ttk.Button(top, text="Snapshot", command=lambda: self.send_command("snapshot")).pack(side="right")
+        ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=12)
+        ttk.Label(top, textvariable=self.header_fw_text, style="HeaderMuted.TLabel").pack(side="left")
+        self.header_check_label = ttk.Label(top, textvariable=self.header_check_text, style="Header.TLabel")
+        self.header_check_label.pack(side="left", padx=(14, 0))
+        ttk.Label(top, textvariable=self.header_admin_text, style="HeaderMuted.TLabel").pack(side="left", padx=(14, 0))
+        ttk.Label(top, textvariable=self.header_pause_text, style="HeaderMuted.TLabel").pack(side="left", padx=(14, 0))
+        ttk.Button(top, text="연결", command=self.connect).pack(side="right")
+        ttk.Button(top, text="연결 해제", command=self.disconnect).pack(side="right", padx=6)
+        ttk.Button(top, text="전체 상태 조회", command=lambda: self.send_command("snapshot")).pack(side="right")
 
-        self.tabs = ttk.Notebook(self)
-        self.tabs.pack(fill="both", expand=True, padx=10, pady=(0, 8))
-        self.dashboard_tab = ttk.Frame(self.tabs, padding=10)
-        self.watch_tab = ttk.Frame(self.tabs, padding=10)
-        self.events_tab = ttk.Frame(self.tabs, padding=10)
-        self.console_tab = ttk.Frame(self.tabs, padding=8)
-        self.control_tab = ttk.Frame(self.tabs, padding=10)
-        self.settings_tab = ttk.Frame(self.tabs, padding=10)
-        self.tabs.add(self.dashboard_tab, text="Dashboard")
-        self.tabs.add(self.watch_tab, text="Live Watch")
-        self.tabs.add(self.events_tab, text="Events / Fault")
-        self.tabs.add(self.console_tab, text="Console")
-        self.tabs.add(self.control_tab, text="Admin Controls")
-        self.tabs.add(self.settings_tab, text="Settings")
+        main = ttk.Frame(self)
+        main.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        navigation = tk.Frame(main, width=176, bg="#2f3439", bd=0)
+        navigation.pack(side="left", fill="y")
+        navigation.pack_propagate(False)
+        ttk.Separator(main, orient="vertical").pack(side="left", fill="y")
+        content = ttk.Frame(main)
+        content.pack(side="left", fill="both", expand=True)
+        content.rowconfigure(0, weight=1)
+        content.columnconfigure(0, weight=1)
+
+        self.dashboard_tab = ttk.Frame(content, padding=10)
+        self.watch_tab = ttk.Frame(content, padding=10)
+        self.events_tab = ttk.Frame(content, padding=10)
+        self.fault_tab = ttk.Frame(content, padding=10)
+        self.console_tab = ttk.Frame(content, padding=8)
+        self.control_tab = ttk.Frame(content, padding=10)
+        self.settings_tab = ttk.Frame(content, padding=10)
+        self.pages = {
+            "dashboard": self.dashboard_tab,
+            "watch": self.watch_tab,
+            "events": self.events_tab,
+            "fault": self.fault_tab,
+            "console": self.console_tab,
+            "control": self.control_tab,
+            "settings": self.settings_tab,
+        }
+        for page in self.pages.values():
+            page.grid(row=0, column=0, sticky="nsew")
+
+        tk.Label(navigation, text="DEVICE CONSOLE", bg="#2f3439", fg="#aeb6bf",
+                 font=("Segoe UI", 9, "bold"), anchor="w", padx=14, pady=16).pack(fill="x")
+        self.nav_buttons: dict[str, tk.Button] = {}
+        navigation_items = (
+            ("dashboard", "대시보드"),
+            ("watch", "라이브 워치"),
+            ("events", "이벤트"),
+            ("fault", "폴트 분석"),
+            ("console", "콘솔"),
+            ("control", "관리자 제어"),
+            ("settings", "설정"),
+        )
+        for key, label in navigation_items:
+            button = tk.Button(
+                navigation, text=label, command=lambda page=key: self._show_page(page),
+                anchor="w", padx=16, pady=10, relief="flat", bd=0,
+                bg="#2f3439", fg="#f0f3f6", activebackground="#3d444d",
+                activeforeground="#ffffff", font=("Segoe UI", 10), cursor="hand2",
+            )
+            button.pack(fill="x")
+            self.nav_buttons[key] = button
         self._build_dashboard()
         self._build_watch()
         self._build_events()
+        self._build_faults()
         self._build_console()
         self._build_controls()
         self._build_settings()
+        self._show_page("dashboard")
+
+    def _show_page(self, page_name: str) -> None:
+        page = self.pages[page_name]
+        page.tkraise()
+        for name, button in self.nav_buttons.items():
+            selected = name == page_name
+            button.configure(
+                bg="#0969da" if selected else "#2f3439",
+                activebackground="#0550ae" if selected else "#3d444d",
+                font=("Segoe UI", 10, "bold" if selected else "normal"),
+            )
 
     def _build_dashboard(self) -> None:
         cards = ttk.Frame(self.dashboard_tab)
         cards.pack(fill="x")
         self.card_vars: dict[str, tk.StringVar] = {}
         definitions = (
-            ("Service", "service"), ("Valve", "valve"), ("Alarm", "alarm"),
-            ("Left pressure", "left"), ("Right pressure", "right"), ("Outlet", "out"),
-            ("Left gas", "left_gas"), ("Right gas", "right_gas"),
-            ("Left ECO", "left_eco"), ("Right ECO", "right_eco"),
+            ("실제 SERVICE 방향", "service"), ("밸브 명령 / 피드백", "valve"), ("알람", "alarm"),
+            ("좌측 압력", "left"), ("우측 압력", "right"), ("출구 압력", "out"),
+            ("좌측 가스", "left_gas"), ("우측 가스", "right_gas"),
+            ("좌측 ECO", "left_eco"), ("우측 ECO", "right_eco"),
             ("Wi-Fi", "wifi"), ("Ethernet", "ethernet"),
         )
         for index, (title, key) in enumerate(definitions):
@@ -789,22 +868,24 @@ class GasChangerGui(tk.Tk):
             ttk.Label(frame, textvariable=variable, style="CardValue.TLabel").pack()
         body = ttk.Panedwindow(self.dashboard_tab, orient="horizontal")
         body.pack(fill="both", expand=True, pady=(10, 0))
-        health_frame = ttk.LabelFrame(body, text="Subsystem health", padding=6)
-        detail_frame = ttk.LabelFrame(body, text="Latest telemetry", padding=6)
+        health_frame = ttk.LabelFrame(body, text="장치 상태", padding=6)
+        detail_frame = ttk.LabelFrame(body, text="최신 Telemetry", padding=6)
         body.add(health_frame, weight=1)
         body.add(detail_frame, weight=2)
         self.health_tree = ttk.Treeview(health_frame, columns=("name", "state", "detail"), show="headings")
-        self.health_tree.heading("name", text="Subsystem")
-        self.health_tree.heading("state", text="State")
-        self.health_tree.heading("detail", text="Detail")
+        self.health_tree.heading("name", text="분야")
+        self.health_tree.heading("state", text="상태")
+        self.health_tree.heading("detail", text="상세")
         self.health_tree.column("name", width=130)
         self.health_tree.column("state", width=90, anchor="center")
         self.health_tree.column("detail", width=430)
         self.health_tree.pack(fill="both", expand=True)
+        self.health_tree.tag_configure("check", foreground="#b54708", background="#fff4e5")
+        self.health_tree.tag_configure("fault", foreground="#a40e26")
         self.detail_tree = ttk.Treeview(detail_frame, columns=("value", "updated"), show="tree headings")
-        self.detail_tree.heading("#0", text="Variable")
-        self.detail_tree.heading("value", text="Value")
-        self.detail_tree.heading("updated", text="Updated")
+        self.detail_tree.heading("#0", text="변수")
+        self.detail_tree.heading("value", text="값")
+        self.detail_tree.heading("updated", text="갱신 경과")
         self.detail_tree.column("#0", width=300)
         self.detail_tree.column("value", width=480)
         self.detail_tree.column("updated", width=100)
@@ -813,17 +894,18 @@ class GasChangerGui(tk.Tk):
     def _build_watch(self) -> None:
         toolbar = ttk.Frame(self.watch_tab)
         toolbar.pack(fill="x", pady=(0, 8))
-        ttk.Button(toolbar, text="Clear chart", command=self._clear_watch_chart).pack(side="right")
-        ttk.Button(toolbar, text="Export CSV", command=self._export_watch_csv).pack(side="right", padx=6)
+        ttk.Button(toolbar, text="그래프 기록 지우기", style="Warning.TButton",
+                   command=self._clear_watch_chart).pack(side="right")
+        ttk.Button(toolbar, text="CSV 내보내기", command=self._export_watch_csv).pack(side="right", padx=6)
         left = ttk.Frame(self.watch_tab)
         left.pack(side="left", fill="y")
         columns = ("enabled", "value", "unit", "age")
         self.watch_tree = ttk.Treeview(left, columns=columns, show="tree headings", height=18)
-        self.watch_tree.heading("#0", text="Variable")
-        self.watch_tree.heading("enabled", text="Plot")
-        self.watch_tree.heading("value", text="Value")
-        self.watch_tree.heading("unit", text="Unit")
-        self.watch_tree.heading("age", text="Age")
+        self.watch_tree.heading("#0", text="변수")
+        self.watch_tree.heading("enabled", text="그래프")
+        self.watch_tree.heading("value", text="값")
+        self.watch_tree.heading("unit", text="단위")
+        self.watch_tree.heading("age", text="경과")
         self.watch_tree.column("#0", width=170)
         self.watch_tree.column("enabled", width=45, anchor="center")
         self.watch_tree.column("value", width=260, anchor="w")
@@ -836,7 +918,7 @@ class GasChangerGui(tk.Tk):
             self.watch_rows[definition.path] = item
             self.watch_enabled[definition.path] = tk.BooleanVar(value=index < 3)
             self.watch_history[definition.path] = deque(maxlen=180)
-        chart_frame = ttk.LabelFrame(self.watch_tab, text="Last 180 samples", padding=5)
+        chart_frame = ttk.LabelFrame(self.watch_tab, text="최근 180개 샘플", padding=5)
         chart_frame.pack(side="left", fill="both", expand=True, padx=(10, 0))
         self.chart = LiveChart(chart_frame)
         self.chart.pack(fill="both", expand=True)
@@ -844,32 +926,27 @@ class GasChangerGui(tk.Tk):
     def _build_events(self) -> None:
         toolbar = ttk.Frame(self.events_tab)
         toolbar.pack(fill="x", pady=(0, 8))
-        ttk.Label(toolbar, text="Category").pack(side="left")
+        ttk.Label(toolbar, text="분야").pack(side="left")
         self.event_category = tk.StringVar(value="all")
         category_box = ttk.Combobox(toolbar, textvariable=self.event_category, values=EVENT_CATEGORIES,
                                     state="readonly", width=12)
         category_box.pack(side="left", padx=6)
         category_box.bind("<<ComboboxSelected>>", self._apply_event_filter)
-        ttk.Button(toolbar, text="Refresh all 32", command=self._refresh_events).pack(side="left")
-        ttk.Button(toolbar, text="Read fault", command=lambda: self.send_command("fault")).pack(side="left", padx=6)
-        ttk.Button(toolbar, text="Read version", command=lambda: self.send_command("version")).pack(side="left")
-        ttk.Button(toolbar, text="Clear view", command=self._clear_events_faults).pack(side="right")
-        ttk.Button(toolbar, text="Export", command=self._export_events_faults).pack(side="right", padx=6)
-        identity = ttk.LabelFrame(self.events_tab, text="Firmware identity (fault correlation)", padding=(8, 5))
-        identity.pack(fill="x", pady=(0, 8))
-        ttk.Label(identity, textvariable=self.firmware_identity, style="Status.TLabel").pack(anchor="w")
-        ttk.Label(identity, textvariable=self.firmware_build_detail, foreground="#57606a").pack(anchor="w")
-        ttk.Label(identity, textvariable=self.firmware_source_detail, foreground="#57606a").pack(anchor="w")
+        ttk.Button(toolbar, text="최근 이벤트 32개 조회", command=self._refresh_events).pack(side="left")
+        ttk.Button(toolbar, text="PC 이벤트 기록 지우기", style="Warning.TButton",
+                   command=self._clear_event_view).pack(side="right")
+        ttk.Button(toolbar, text="전체 진단 기록 내보내기",
+                   command=self._export_events_faults).pack(side="right", padx=6)
         event_pane = ttk.Panedwindow(self.events_tab, orient="horizontal")
         event_pane.pack(fill="both", expand=True)
         event_list = ttk.Frame(event_pane)
-        event_detail = ttk.LabelFrame(event_pane, text="Selected event meaning", padding=6)
+        event_detail = ttk.LabelFrame(event_pane, text="선택한 이벤트 상세", padding=6)
         event_pane.add(event_list, weight=3)
         event_pane.add(event_detail, weight=2)
         columns = ("pc_time", "category", "name", "summary", "tick", "seq")
         self.event_tree = ttk.Treeview(event_list, columns=columns, show="headings", height=13)
-        headings = {"pc_time": "PC TIME", "category": "CATEGORY", "name": "EVENT",
-                    "summary": "SUMMARY", "tick": "DEVICE ms", "seq": "SEQ"}
+        headings = {"pc_time": "PC 시간", "category": "분야", "name": "이벤트",
+                    "summary": "발생 내용", "tick": "장치 ms", "seq": "순번"}
         for column in columns:
             self.event_tree.heading(column, text=headings[column])
         self.event_tree.column("pc_time", width=175)
@@ -879,11 +956,28 @@ class GasChangerGui(tk.Tk):
         self.event_tree.column("tick", width=90, anchor="e")
         self.event_tree.column("seq", width=65, anchor="e")
         self.event_tree.pack(fill="both", expand=True)
+        self.event_tree.tag_configure("check", foreground="#b54708", background="#fff4e5")
+        self.event_tree.tag_configure("fault", foreground="#a40e26")
         self.event_tree.bind("<<TreeviewSelect>>", self._show_event_detail)
         self.event_detail_text = ScrolledText(event_detail, width=38, height=12,
                                               font=("Segoe UI", 10), wrap="word")
         self.event_detail_text.pack(fill="both", expand=True)
-        fault_frame = ttk.LabelFrame(self.events_tab, text="Fault analysis", padding=5)
+
+    def _build_faults(self) -> None:
+        toolbar = ttk.Frame(self.fault_tab)
+        toolbar.pack(fill="x", pady=(0, 8))
+        ttk.Button(toolbar, text="폴트 조회", command=lambda: self.send_command("fault")).pack(side="left")
+        ttk.Button(toolbar, text="FW 버전 조회", command=lambda: self.send_command("version")).pack(side="left", padx=6)
+        ttk.Button(toolbar, text="PC 폴트 기록 지우기", style="Warning.TButton",
+                   command=self._clear_fault_view).pack(side="right")
+        ttk.Button(toolbar, text="전체 진단 기록 내보내기",
+                   command=self._export_events_faults).pack(side="right", padx=6)
+        identity = ttk.LabelFrame(self.fault_tab, text="FW 식별 정보와 폴트 연계", padding=(8, 5))
+        identity.pack(fill="x", pady=(0, 8))
+        ttk.Label(identity, textvariable=self.firmware_identity, style="Status.TLabel").pack(anchor="w")
+        ttk.Label(identity, textvariable=self.firmware_build_detail, foreground="#57606a").pack(anchor="w")
+        ttk.Label(identity, textvariable=self.firmware_source_detail, foreground="#57606a").pack(anchor="w")
+        fault_frame = ttk.LabelFrame(self.fault_tab, text="폴트 분석 결과", padding=5)
         fault_frame.pack(fill="both", expand=True, pady=(10, 0))
         self.fault_text = ScrolledText(fault_frame, height=9, font=("Consolas", 10), wrap="word")
         self.fault_text.pack(fill="both", expand=True)
@@ -893,61 +987,75 @@ class GasChangerGui(tk.Tk):
         pause_frame.pack(fill="x", pady=(0, 7))
         ttk.Button(pause_frame, textvariable=self.console_pause_text,
                    command=self._toggle_console_pause).pack(side="left")
-        ttk.Checkbutton(pause_frame, text="Auto-pause on new Fault / CHECK",
-                        variable=self.console_auto_pause).pack(side="left", padx=8)
-        ttk.Button(pause_frame, text="Discard buffered", command=self._discard_console_buffer).pack(side="left")
+        ttk.Checkbutton(pause_frame, text="새 Fault / CHECK 발생 시 자동 일시정지",
+                         variable=self.console_auto_pause).pack(side="left", padx=8)
+        ttk.Button(pause_frame, text="대기 중 원문 버리기", style="Warning.TButton",
+                   command=self._discard_console_buffer).pack(side="left")
         ttk.Label(pause_frame, textvariable=self.console_pause_status,
                   style="Status.TLabel").pack(side="right")
         command_frame = ttk.Frame(self.console_tab)
         command_frame.pack(fill="x", pady=(0, 7))
-        ttk.Label(command_frame, text="Command", style="Status.TLabel").pack(side="left")
+        ttk.Label(command_frame, text="명령", style="Status.TLabel").pack(side="left")
         self.command_entry = ttk.Entry(command_frame)
         self.command_entry.pack(side="left", fill="x", expand=True, padx=6)
         self.command_entry.bind("<Return>", lambda _event: self._send_console())
         self.command_entry.bind("<Up>", lambda _event: self._history(-1))
         self.command_entry.bind("<Down>", lambda _event: self._history(1))
-        ttk.Button(command_frame, text="Send ↵", command=self._send_console).pack(side="left")
-        ttk.Button(command_frame, text="Clear visible", command=lambda: self.console.delete("1.0", "end")).pack(side="left", padx=(6, 0))
+        ttk.Button(command_frame, text="전송 ↵", command=self._send_console).pack(side="left")
+        ttk.Button(command_frame, text="콘솔 화면 지우기", style="Warning.TButton",
+                   command=lambda: self.console.delete("1.0", "end")).pack(side="left", padx=(6, 0))
         self.console = ScrolledText(self.console_tab, bg="#0d1117", fg="#c9d1d9", insertbackground="white", font=("Consolas", 10), wrap="word")
         self.console.pack(fill="both", expand=True)
 
     def _build_controls(self) -> None:
         warning = ttk.Label(
             self.control_tab,
-            text="Dangerous controls are enforced by firmware Admin authentication. "
-                 "Confirm the gas line is safe before operating the valve.",
-            foreground="#a40e26",
+            text="위험 제어는 Admin 인증 후에만 활성화됩니다. 밸브를 조작하기 전에 가스 라인의 안전 상태를 확인하십시오.",
+            foreground="#b54708",
             wraplength=900,
         )
         warning.pack(fill="x", pady=(0, 10))
-        login = ttk.LabelFrame(self.control_tab, text="Admin session", padding=10)
+        login = ttk.LabelFrame(self.control_tab, text="Admin 세션", padding=10)
         login.pack(fill="x")
         self.admin_password = tk.StringVar()
-        self.admin_state = tk.StringVar(value="Locked")
-        ttk.Label(login, text="Password").pack(side="left")
+        self.admin_state = tk.StringVar(value="잠금")
+        ttk.Label(login, text="암호").pack(side="left")
         password_entry = ttk.Entry(login, textvariable=self.admin_password, show="●", width=30)
         password_entry.pack(side="left", padx=8)
         password_entry.bind("<Return>", lambda _event: self._admin_login())
-        ttk.Button(login, text="Unlock", command=self._admin_login).pack(side="left")
-        ttk.Button(login, text="Lock", command=lambda: self.send_command("admin logout")).pack(side="left", padx=6)
-        ttk.Button(login, text="View network credentials",
-                   command=lambda: self.send_command("config secrets")).pack(side="left", padx=6)
+        ttk.Button(login, text="잠금 해제", command=self._admin_login).pack(side="left")
+        ttk.Button(login, text="잠금", command=lambda: self.send_command("admin logout")).pack(side="left", padx=6)
+        self.network_credentials_button = ttk.Button(
+            login, text="네트워크 인증정보 조회", command=lambda: self.send_command("config secrets"),
+            state="disabled",
+        )
+        self.network_credentials_button.pack(side="left", padx=6)
         ttk.Label(login, textvariable=self.admin_state, style="Status.TLabel").pack(side="right")
-        actions = ttk.LabelFrame(self.control_tab, text="Board operations", padding=12)
+        actions = ttk.LabelFrame(self.control_tab, text="보드 기능 제어", padding=12)
         actions.pack(fill="x", pady=12)
-        ttk.Button(actions, text="Valve → LEFT", style="Danger.TButton", command=lambda: self._confirm_control("control valve left confirm", "Move the 3-way valve to LEFT?" )).grid(row=0, column=0, padx=5, pady=5, sticky="ew")
-        ttk.Button(actions, text="Valve → RIGHT", style="Danger.TButton", command=lambda: self._confirm_control("control valve right confirm", "Move the 3-way valve to RIGHT?" )).grid(row=0, column=1, padx=5, pady=5, sticky="ew")
-        ttk.Button(actions, text="Buzzer test", command=lambda: self._confirm_control("control buzzer 1000 confirm", "Sound the buzzer for 1 second?" )).grid(row=1, column=0, padx=5, pady=5, sticky="ew")
-        ttk.Button(actions, text="Panel lamp test", command=lambda: self._confirm_control("control lamps 2000 confirm", "Run the panel lamp test for 2 seconds?" )).grid(row=1, column=1, padx=5, pady=5, sticky="ew")
-        ttk.Button(actions, text="Send Wi-Fi status", command=lambda: self._confirm_control("control send wifi confirm", "Send one Wi-Fi status packet?" )).grid(row=2, column=0, padx=5, pady=5, sticky="ew")
-        ttk.Button(actions, text="Send Ethernet status", command=lambda: self._confirm_control("control send ethernet confirm", "Send one Ethernet status packet?" )).grid(row=2, column=1, padx=5, pady=5, sticky="ew")
-        ttk.Button(actions, text="Reboot MCU", style="Danger.TButton", command=lambda: self._confirm_control("control reboot confirm", "Reboot the controller now?", phrase="REBOOT" )).grid(row=3, column=0, columnspan=2, padx=5, pady=(18, 5), sticky="ew")
+        self.admin_action_buttons: list[ttk.Button] = []
+        control_definitions = (
+            ("밸브 LEFT 이동", "Danger.TButton", "control valve left confirm", "3-way 밸브를 LEFT로 이동하시겠습니까?", None, 0, 0, 1),
+            ("밸브 RIGHT 이동", "Danger.TButton", "control valve right confirm", "3-way 밸브를 RIGHT로 이동하시겠습니까?", None, 0, 1, 1),
+            ("부저 1초 시험", "TButton", "control buzzer 1000 confirm", "부저를 1초간 작동하시겠습니까?", None, 1, 0, 1),
+            ("패널 램프 2초 시험", "TButton", "control lamps 2000 confirm", "패널 램프 시험을 2초간 실행하시겠습니까?", None, 1, 1, 1),
+            ("Wi-Fi 상태 1회 전송", "TButton", "control send wifi confirm", "Wi-Fi 상태 패킷을 1회 전송하시겠습니까?", None, 2, 0, 1),
+            ("Ethernet 상태 1회 전송", "TButton", "control send ethernet confirm", "Ethernet 상태 패킷을 1회 전송하시겠습니까?", None, 2, 1, 1),
+            ("MCU 재부팅", "Danger.TButton", "control reboot confirm", "컨트롤러를 지금 재부팅하시겠습니까?", "REBOOT", 3, 0, 2),
+        )
+        for text, style, command, prompt, phrase, row, column, span in control_definitions:
+            button = ttk.Button(
+                actions, text=text, style=style, state="disabled",
+                command=lambda cmd=command, ask=prompt, word=phrase: self._confirm_control(cmd, ask, word),
+            )
+            button.grid(row=row, column=column, columnspan=span, padx=5,
+                        pady=(18, 5) if row == 3 else 5, sticky="ew")
+            self.admin_action_buttons.append(button)
         actions.columnconfigure(0, weight=1)
         actions.columnconfigure(1, weight=1)
         ttk.Label(
             self.control_tab,
-            text="Configuration/EEPROM values are intentionally view-only in this release. "
-                 "They remain editable through the validated front-panel menu so field diagnostics cannot silently alter calibration.",
+            text="설정 및 EEPROM 값은 이 버전에서 조회만 가능합니다. 교정값이 현장 진단 중에 변경되지 않도록 검증된 전면 메뉴에서만 수정할 수 있습니다.",
             wraplength=900,
         ).pack(fill="x")
 
@@ -999,7 +1107,8 @@ class GasChangerGui(tk.Tk):
         self.command_pending = False
         self.secret_capture_active = False
         self.secret_payload = {}
-        self.admin_state.set("Locked")
+        if hasattr(self, "admin_state"):
+            self._set_admin_locked(True)
         self._set_connection(False)
 
     def send_command(self, command: str, show_outbound: bool = True) -> None:
@@ -1013,10 +1122,18 @@ class GasChangerGui(tk.Tk):
 
     def _set_connection(self, connected: bool) -> None:
         self.connected = connected
-        self.connection_text.set("Connected" if connected else "Disconnected")
+        self.connection_text.set("연결됨" if connected else "연결 끊김")
         self.status_dot.delete("all")
         color = "#2da44e" if connected else "#cf222e"
         self.status_dot.create_oval(2, 2, 14, 14, fill=color, outline=color)
+
+    def _set_admin_locked(self, locked: bool) -> None:
+        self.admin_state.set("잠금" if locked else "잠금 해제 · 5분")
+        self.header_admin_text.set("Admin 잠금" if locked else "Admin 잠금 해제")
+        button_state = "disabled" if locked else "normal"
+        self.network_credentials_button.configure(state=button_state)
+        for button in self.admin_action_buttons:
+            button.configure(state=button_state)
 
     def _append_console(self, text: str, tag: Optional[str] = None) -> None:
         if self.console_paused.get():
@@ -1039,25 +1156,27 @@ class GasChangerGui(tk.Tk):
 
     def _update_console_pause_status(self) -> None:
         if not self.console_paused.get():
-            self.console_pause_status.set("LIVE · background capture active")
+            self.console_pause_status.set("LIVE · 백그라운드 수집 중")
+            self.header_pause_text.set("수집 LIVE")
             return
         buffered = len(self.console_pause_buffer)
         dropped = f" · {self.console_pause_dropped} old chunks dropped" if self.console_pause_dropped else ""
         reason_text = f" · {self.console_pause_reason}" if self.console_pause_reason else ""
         self.console_pause_status.set(
-            f"PAUSED{reason_text} · {buffered} chunks buffered{dropped} · parsing continues"
+            f"일시정지{reason_text} · {buffered}개 원문 대기{dropped} · 분석은 계속 진행"
         )
+        self.header_pause_text.set("표시 일시정지 · 수집 계속")
 
     def _set_console_paused(self, paused: bool, reason: str = "") -> None:
         if paused:
             self.console_paused.set(True)
             self.console_pause_reason = reason
-            self.console_pause_text.set("Resume + show buffered")
+            self.console_pause_text.set("재개하고 대기 원문 표시")
             self._update_console_pause_status()
             return
         self.console_paused.set(False)
         self.console_pause_reason = ""
-        self.console_pause_text.set("Pause display")
+        self.console_pause_text.set("표시 일시정지")
         while self.console_pause_buffer:
             text, tag = self.console_pause_buffer.popleft()
             self._append_console_direct(text, tag)
@@ -1167,8 +1286,9 @@ class GasChangerGui(tk.Tk):
         return datetime.fromtimestamp(anchor + tick / 1000.0).astimezone().isoformat(timespec="milliseconds")
 
     def _insert_event_record(self, identity: str, record: dict[str, object]) -> None:
+        tags = ("check",) if record.get("name") == "CHECK_SET" else ()
         self.event_tree.insert("", "end", iid=identity, values=(record["pc_time"], record["category"],
-            record["name"], record["summary"], record["device_tick_ms"], record["sequence"]))
+            record["name"], record["summary"], record["device_tick_ms"], record["sequence"]), tags=tags)
 
     def _apply_event_filter(self, _event: object = None) -> None:
         for item in self.event_tree.get_children():
@@ -1210,8 +1330,9 @@ class GasChangerGui(tk.Tk):
         self.event_record_by_iid[identity] = record
         selected = self.event_category.get().upper()
         if selected == "ALL" or category.upper() == selected:
+            tags = ("check",) if name == "CHECK_SET" else ()
             self.event_tree.insert("", 0, iid=identity, values=(record["pc_time"], category,
-                name, title, tick, sequence))
+                name, title, tick, sequence), tags=tags)
         return True
 
     def _append_fault_interpretation(self, kind: str, values: dict[str, object], text: str) -> None:
@@ -1224,25 +1345,30 @@ class GasChangerGui(tk.Tk):
         interpretations = self.fault_records[-1].setdefault("interpretations", [])
         if isinstance(interpretations, list):
             interpretations.append(text)
-        self.fault_text.insert("end", "[사람이 읽는 해석]\n" + text + "\n")
+        self.fault_text.insert("end", "\n" + text + "\n")
         self.fault_text.see("end")
 
     def _append_fault_register_interpretation(self, values: dict[str, object]) -> None:
         text = (
-            f"실행 위치 PC=0x{int(values.get('pc', 0)):08X}, 복귀 위치 LR=0x{int(values.get('lr', 0)):08X}\n"
-            f"CFSR: {format_metric('fault_regs.cfsr', values.get('cfsr', 0))}\n"
-            f"HFSR: {format_metric('fault_regs.hfsr', values.get('hfsr', 0))}\n"
-            f"Fault 주소: BFAR=0x{int(values.get('bfar', 0)):08X}, MMFAR=0x{int(values.get('mmfar', 0)):08X}"
+            f"실행 위치 PC\n0x{int(values.get('pc', 0)):08X}\n\n"
+            f"복귀 위치 LR\n0x{int(values.get('lr', 0)):08X}\n\n"
+            f"CFSR\n{format_metric('fault_regs.cfsr', values.get('cfsr', 0))}\n\n"
+            f"HFSR\n{format_metric('fault_regs.hfsr', values.get('hfsr', 0))}\n\n"
+            f"Bus Fault 주소 BFAR\n0x{int(values.get('bfar', 0)):08X}\n\n"
+            f"MemManage Fault 주소 MMFAR\n0x{int(values.get('mmfar', 0)):08X}"
         )
         self._append_fault_interpretation("registers", values, text)
 
     def _append_fault_last_reset_interpretation(self, values: dict[str, object]) -> None:
         text = (
-            f"마지막 활성 IRQ: {format_metric('fault_last_reset.irq_active', values.get('irq_active', 0))}\n"
-            f"마지막 완료 IRQ: {format_metric('fault_last_reset.irq_done', values.get('irq_done', 0))}\n"
-            f"CPU 예외번호(IPSR)={values.get('ipsr', 0)}, 인터럽트 마스크(PRIMASK/BASEPRI/FAULTMASK)="
-            f"{values.get('primask', 0)}/{values.get('basepri', 0)}/{values.get('faultmask', 0)}\n"
-            f"리셋 직전 storm: Wi-Fi={values.get('wifi_storm', 0)}, GPIO EXTI={values.get('exti_storm', 0)}"
+            f"마지막 활성 IRQ\n{format_metric('fault_last_reset.irq_active', values.get('irq_active', 0))}\n\n"
+            f"마지막 완료 IRQ\n{format_metric('fault_last_reset.irq_done', values.get('irq_done', 0))}\n\n"
+            f"CPU 예외번호 IPSR\n{values.get('ipsr', 0)}\n\n"
+            f"인터럽트 마스크 PRIMASK\n{values.get('primask', 0)}\n\n"
+            f"인터럽트 우선순위 BASEPRI\n{values.get('basepri', 0)}\n\n"
+            f"Fault 마스크 FAULTMASK\n{values.get('faultmask', 0)}\n\n"
+            f"리셋 직전 Wi-Fi storm\n{values.get('wifi_storm', 0)}\n\n"
+            f"리셋 직전 GPIO EXTI storm\n{values.get('exti_storm', 0)}"
         )
         self._append_fault_interpretation("last_reset", values, text)
 
@@ -1286,7 +1412,7 @@ class GasChangerGui(tk.Tk):
             if event_match:
                 event_added = self._add_event_line(line, event_match)
                 if event_added and event_match.group(3) == "CHECK_SET":
-                    self._auto_pause_console("CHECK asserted")
+                    self._auto_pause_console("CHECK 발생")
             if line.startswith("fw_product="):
                 git_value = str(values.get("git", ""))[:12]
                 dirty = " dirty" if values.get("dirty", 0) else ""
@@ -1297,6 +1423,7 @@ class GasChangerGui(tk.Tk):
                 self.firmware_build_detail.set(
                     f"Git {git_value}{dirty} · {values.get('config', '-')}"
                 )
+                self.header_fw_text.set(f"FW {values.get('fw_version', '-')} · Build {str(values.get('build_id', '-'))[:8]}")
             elif line.startswith("source_id="):
                 self.firmware_source_detail.set(
                     f"Source {values.get('source_id', '-')} · Built {values.get('build_utc', '-')} · "
@@ -1307,10 +1434,10 @@ class GasChangerGui(tk.Tk):
                 snapshot_tick = values.get("fault_snapshot_tick")
                 if isinstance(fault_boot, int) and isinstance(snapshot_tick, int) and fault_boot in self.boot_anchors:
                     fault_pc_time = self._pc_time_for_tick(snapshot_tick, fault_boot)
-                    time_basis = "fault tick synchronized while PC was connected"
+                    time_basis = "PC 연결 중 장치 tick과 동기화된 시각"
                 else:
                     fault_pc_time = datetime.now().astimezone().isoformat(timespec="milliseconds")
-                    time_basis = "PC observation time (fault boot was not synchronized)"
+                    time_basis = "PC 관측 시각 · 해당 부팅의 장치 tick 미동기화"
                 record = {"pc_time": fault_pc_time, "pc_time_basis": time_basis,
                           "data": values, "raw": line, "interpretations": []}
                 fault_identity = (values.get("fault_boot"), values.get("count"),
@@ -1319,29 +1446,28 @@ class GasChangerGui(tk.Tk):
                     self.last_fault_identity = fault_identity
                     self.fault_records.append(record)
                     self.fault_text.insert("end", f"[{record['pc_time']}] ({record['pc_time_basis']})\n")
-                    self.fault_text.insert("end", line + "\n")
                     interpretation = (
-                        f"리셋 원인: {format_metric('fault.reset_flags', values.get('reset_flags', 0))}\n"
-                        f"Fault 종류: {format_metric('fault.type', values.get('type', 0))}\n"
-                        f"발생 횟수: {values.get('count', 0)}"
+                        f"Fault 종류\n{format_metric('fault.type', values.get('type', 0))}\n\n"
+                        f"리셋 원인\n{format_metric('fault.reset_flags', values.get('reset_flags', 0))}\n\n"
+                        f"발생 횟수\n{values.get('count', 0)}"
                     )
                     record["interpretations"].append(interpretation)
-                    self.fault_text.insert("end", "[사람이 읽는 해석]\n" + interpretation + "\n")
+                    self.fault_text.insert("end", interpretation + "\n\n기술 원문\n" + line + "\n")
                     self.fault_text.see("end")
                     if isinstance(values.get("count"), int) and int(values["count"]) > 0:
-                        self._auto_pause_console("new Fault record")
+                        self._auto_pause_console("새 Fault 기록")
             elif line.startswith("fault_regs "):
                 self._append_fault_register_interpretation(values)
             elif line.startswith("fault_last_reset "):
                 self._append_fault_last_reset_interpretation(values)
             if line.startswith("OK admin unlocked"):
-                self.admin_state.set("Unlocked (5 min)")
+                self._set_admin_locked(False)
                 self.admin_password.set("")
             elif line.startswith("OK admin locked") or line.startswith("ERR admin"):
-                self.admin_state.set("Locked")
+                self._set_admin_locked(True)
             elif line.startswith("admin "):
                 locked = parse_key_values(line).get("locked", 1)
-                self.admin_state.set("Locked" if locked else "Unlocked")
+                self._set_admin_locked(bool(locked))
 
     def _poll_tick(self) -> None:
         now = time.monotonic()
@@ -1395,24 +1521,33 @@ class GasChangerGui(tk.Tk):
         self.card_vars["wifi"].set(format_metric("wifi.link", get("wifi.link", 0)))
         self.card_vars["ethernet"].set(format_metric("ethernet.phy", get("ethernet.phy", 0)))
         check_value = get("status.check", get("telemetry.check", 0))
+        check_active = isinstance(check_value, int) and check_value != 0
+        if check_active:
+            check_count = sum(1 for mask, _label in CHECK_BITS if check_value & mask)
+            self.header_check_text.set(f"CHECK {check_count}개")
+            self.header_check_label.configure(style="Check.TLabel")
+        else:
+            self.header_check_text.set("CHECK 정상")
+            self.header_check_label.configure(style="Header.TLabel")
         health = (
             ("Valve feedback", "CHECK" if check_value else "OK",
-             f"service={get('status.service')}, {format_metric('status.check', check_value)}"),
+             f"service={get('status.service')}, {format_metric_compact('status.check', check_value)}"),
             ("Pressure ADC", "OK" if get("status.sensor_ready", 0) else "STARTING", f"raw={get('sensor.dma_raw')}"),
             ("Alarm", "OK" if isinstance(alarm, int) and alarm == 0 else
-             ("ACTIVE" if isinstance(alarm, int) else "UNKNOWN"), format_metric("status.alarm", alarm)),
+             ("ACTIVE" if isinstance(alarm, int) else "UNKNOWN"), format_metric_compact("status.alarm", alarm)),
             ("Wi-Fi", "UP" if get("wifi.link", 0) else "DOWN",
-             f"{format_metric('wifi.link', get('wifi.link', 0))}; LED={format_metric('wifi.led', get('wifi.led', 0))}"),
+             f"{format_metric_compact('wifi.link', get('wifi.link', 0))}; LED={format_metric_compact('wifi.led', get('wifi.led', 0))}"),
             ("Ethernet", "UP" if get("ethernet.phy", 0) else "DOWN",
-             f"{format_metric('ethernet.phy', get('ethernet.phy', 0))}; IP={get('ethernet.ip')}"),
+             f"{format_metric_compact('ethernet.phy', get('ethernet.phy', 0))}; IP={get('ethernet.ip')}"),
             ("RS485", "OK", f"frames={get('rs485.frames')}, crc_bad={get('rs485.crc_bad')}"),
             ("RTOS", "OK" if get("status.task_stall", 0) == 0 else "STALL",
-             format_metric("status.task_stall", get("status.task_stall", 0))),
+             format_metric_compact("status.task_stall", get("status.task_stall", 0))),
         )
         for item in self.health_tree.get_children():
             self.health_tree.delete(item)
         for name, state, detail in health:
-            self.health_tree.insert("", "end", values=(name, state, detail))
+            tags = ("check",) if state == "CHECK" else (("fault",) if state in ("ACTIVE", "STALL") else ())
+            self.health_tree.insert("", "end", values=(name, state, detail), tags=tags)
         snapshot = self.telemetry.snapshot()
         for item in self.detail_tree.get_children():
             self.detail_tree.delete(item)
@@ -1421,14 +1556,14 @@ class GasChangerGui(tk.Tk):
             if "[" in path:
                 continue
             age = time.time() - self.telemetry.updated(path)
-            self.detail_tree.insert("", "end", text=path, values=(format_metric(path, value), f"{age:.1f}s"))
+            self.detail_tree.insert("", "end", text=path, values=(format_metric_compact(path, value), f"{age:.1f}s"))
 
     @staticmethod
     def _display_watch(definition: WatchDefinition, raw: object) -> str:
         if isinstance(raw, (int, float)):
             value = raw / definition.divisor
-            return f"{value:.1f}" if definition.divisor != 1.0 else format_metric(definition.path, raw)
-        return format_metric(definition.path, raw)
+            return f"{value:.1f}" if definition.divisor != 1.0 else format_metric_compact(definition.path, raw)
+        return format_metric_compact(definition.path, raw)
 
     def _refresh_watch(self) -> None:
         timestamp = time.time()
@@ -1483,35 +1618,46 @@ class GasChangerGui(tk.Tk):
         if record is None:
             return
         detail = (
-            f"PC time: {record['pc_time']}\n"
-            f"Category: {record['category']}\n"
-            f"Boot: {record['boot']}\n"
-            f"Event: {record['name']} (code {record['code']})\n"
-            f"Device tick: {record['device_tick_ms']} ms\n"
-            f"Sequence: {record['sequence']}\n\n"
-            f"Meaning\n{record['summary']}\n\n"
-            f"Arguments\n{record['meaning']}\n"
-            f"arg0={record['argument0']}\narg1={record['argument1']}\n\n"
-            f"사람이 읽는 해석\n{record['interpretation']}"
+            f"발생 시각\n{record['pc_time']}\n\n"
+            f"분야\n{record['category']}\n\n"
+            f"이벤트\n{record['name']}\n\n"
+            f"발생 내용\n{record['summary']}\n\n"
+            f"상태 및 원인\n{record['interpretation']}\n\n"
+            f"기술 세부값\n"
+            f"Boot {record['boot']}\n"
+            f"Event code {record['code']}\n"
+            f"Device tick {record['device_tick_ms']} ms\n"
+            f"Sequence {record['sequence']}\n"
+            f"arg0 {record['argument0']}\n"
+            f"arg1 {record['argument1']}\n\n"
+            f"FW 인자 정의\n{record['meaning']}"
         )
         self.event_detail_text.delete("1.0", "end")
         self.event_detail_text.insert("1.0", detail)
 
-    def _clear_events_faults(self) -> None:
+    def _clear_event_view(self) -> None:
         if not messagebox.askyesno(
-            "Clear diagnostic view",
-            "Clear events and faults shown on this PC?\n\n"
-            "The retained records inside the controller will not be erased.",
+            "PC 이벤트 기록 지우기",
+            "이 PC 화면과 메모리에 수집된 이벤트 기록을 지우시겠습니까?\n\n"
+            "컨트롤러 내부에 보존된 이벤트 기록은 삭제되지 않습니다.",
         ):
             return
         for item in self.event_tree.get_children():
             self.event_tree.delete(item)
         self.event_records.clear()
         self.event_record_by_iid.clear()
+        self.event_detail_text.delete("1.0", "end")
+
+    def _clear_fault_view(self) -> None:
+        if not messagebox.askyesno(
+            "PC 폴트 기록 지우기",
+            "이 PC 화면과 메모리에 수집된 폴트 기록을 지우시겠습니까?\n\n"
+            "컨트롤러 내부에 보존된 폴트 기록은 삭제되지 않습니다.",
+        ):
+            return
         self.fault_records.clear()
         self.last_fault_identity = None
         self.fault_detail_signatures.clear()
-        self.event_detail_text.delete("1.0", "end")
         self.fault_text.delete("1.0", "end")
 
     def _export_events_faults(self) -> None:

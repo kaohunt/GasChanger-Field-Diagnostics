@@ -28,16 +28,18 @@ PowerShell에서 다음을 실행합니다.
 .\app\start_rtt_gui.ps1
 ```
 
-GUI는 좌/우 가스 상태와 ECO 타이머 Dashboard, 빠른 Live Watch 그래프/CSV,
-PC 메모리에 전체 이력을 유지하는 분야별 이벤트 필터와 상세 의미, FW/Build ID,
-Fault 심볼 분석, 콘솔 명령 입력, 수집·분석을 계속 유지하는 수동/자동 화면 일시정지,
+GUI는 좌측 고정 메뉴와 상단 장치 상태 표시줄을 사용합니다. 좌/우 가스 상태와 ECO
+타이머 대시보드, 빠른 Live Watch 그래프/CSV, PC 메모리에 전체 이력을 유지하는 분야별
+이벤트 화면, 별도의 FW/Build ID 및 Fault 심볼 분석 화면, 콘솔 명령 입력,
+수집·분석을 계속 유지하는 수동/자동 화면 일시정지,
 이벤트/Fault 로컬 Clear 및 JSON/CSV Export를 제공합니다. 연결이 끊기거나 보드가
 재부팅되면 자동으로 재접속합니다. 인증정보 조회 응답은 Admin 세션에서만 허용되며
 원시 콘솔과 세션 로그에는 저장하지 않습니다.
 
 상태값과 비트맵은 원시값을 유지하면서 한글 해석을 함께 표시합니다. Wi-Fi 링크/LED,
 Alarm, 밸브 CHECK, Task stall, Reset 원인, CFSR/HFSR 및 이벤트 인자를 현장에서 바로
-읽을 수 있으며 CSV/JSON Export에도 해석 결과가 포함됩니다.
+읽을 수 있으며 이벤트와 Fault 상세에서는 각 해석을 한 줄씩 구분합니다. 활성 CHECK는
+주황색으로 표시하고 CSV/JSON Export에도 해석 결과를 포함합니다.
 
 명령행 터미널을 사용하려면 다음을 실행합니다.
 
