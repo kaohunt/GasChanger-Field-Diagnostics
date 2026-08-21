@@ -459,6 +459,27 @@ class RttSession:
         except OSError:
             return False
 
+    def force_reconnect(self, clear_pending: bool = True) -> None:
+        """Break a silent TCP session so the worker reconnects without stopping."""
+        if clear_pending:
+            try:
+                while True:
+                    self.commands.get_nowait()
+            except queue.Empty:
+                pass
+        connection = self.connection
+        if connection is None:
+            return
+        try:
+            with self._send_lock:
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                connection.close()
+        except OSError:
+            pass
+
     def _emit(self, kind: str, payload: object) -> None:
         self.events.put((kind, payload))
 
@@ -611,6 +632,11 @@ class OpenOcdManager:
                 self.process.kill()
         self.process = None
 
+    def restart(self) -> None:
+        """Reattach ST-LINK/OpenOCD without issuing MCU reset or halt."""
+        self.stop()
+        self.start()
+
 
 class LiveChart(ttk.Frame):
     COLORS = ("#58a6ff", "#3fb950", "#f0883e", "#d2a8ff", "#f85149", "#8b949e")
@@ -668,6 +694,8 @@ class LiveChart(ttk.Frame):
 
 
 class GasChangerGui(tk.Tk):
+    RTT_RESPONSE_TIMEOUT_S = 5.0
+    RTT_RECOVERY_MIN_INTERVAL_S = 8.0
     SLOW_POLL_COMMANDS = (
         "wifi detail", "ethernet", "rtos", "io", "rs485", "watchdog",
         "config all", "fault", "events all 32", "stats", "admin status",
@@ -700,12 +728,22 @@ class GasChangerGui(tk.Tk):
         self.effective_fast_interval = max(0.2, args.poll_interval)
         self.last_output_drops = 0
         self.command_pending = False
+        self.command_sent_at = 0.0
+        self.rtt_tcp_connected_at = 0.0
+        self.last_rtt_rx_at = 0.0
+        self.rtt_responsive = False
+        self.rtt_recovery_active = False
+        self.rtt_recovery_attempts = 0
+        self.next_rtt_recovery_at = 0.0
+        self.manages_openocd = False
         self.boot_time_anchor: Optional[float] = None
         self.boot_anchors: dict[int, float] = {}
         self.event_response_boot = 0
         self.event_records: list[dict[str, object]] = []
         self.event_record_by_iid: dict[str, dict[str, object]] = {}
         self.fault_records: list[dict[str, object]] = []
+        self.fault_record_by_iid: dict[str, dict[str, object]] = {}
+        self.fault_general_analysis: list[str] = []
         self.last_fault_identity: tuple[object, ...] | None = None
         self.fault_detail_signatures: set[tuple[object, ...]] = set()
         self.console_paused = tk.BooleanVar(value=False)
@@ -775,6 +813,8 @@ class GasChangerGui(tk.Tk):
         ttk.Label(top, textvariable=self.header_pause_text, style="HeaderMuted.TLabel").pack(side="left", padx=(14, 0))
         ttk.Button(top, text="연결", command=self.connect).pack(side="right")
         ttk.Button(top, text="연결 해제", command=self.disconnect).pack(side="right", padx=6)
+        ttk.Button(top, text="ST-LINK/RTT 재연결",
+                   command=lambda: self._recover_rtt_transport(manual=True)).pack(side="right")
         ttk.Button(top, text="전체 상태 조회", command=lambda: self.send_command("snapshot")).pack(side="right")
 
         main = ttk.Frame(self)
@@ -977,10 +1017,33 @@ class GasChangerGui(tk.Tk):
         ttk.Label(identity, textvariable=self.firmware_identity, style="Status.TLabel").pack(anchor="w")
         ttk.Label(identity, textvariable=self.firmware_build_detail, foreground="#57606a").pack(anchor="w")
         ttk.Label(identity, textvariable=self.firmware_source_detail, foreground="#57606a").pack(anchor="w")
-        fault_frame = ttk.LabelFrame(self.fault_tab, text="폴트 분석 결과", padding=5)
-        fault_frame.pack(fill="both", expand=True, pady=(10, 0))
-        self.fault_text = ScrolledText(fault_frame, height=9, font=("Consolas", 10), wrap="word")
+        fault_pane = ttk.Panedwindow(self.fault_tab, orient="horizontal")
+        fault_pane.pack(fill="both", expand=True, pady=(10, 0))
+        fault_list = ttk.LabelFrame(fault_pane, text="수집된 폴트 목록", padding=5)
+        fault_detail = ttk.LabelFrame(fault_pane, text="선택한 폴트 상세 해설", padding=5)
+        fault_pane.add(fault_list, weight=3)
+        fault_pane.add(fault_detail, weight=2)
+        columns = ("pc_time", "boot", "count", "type", "reset", "pc")
+        self.fault_tree = ttk.Treeview(fault_list, columns=columns, show="headings", height=16)
+        headings = {
+            "pc_time": "PC 시간", "boot": "Boot", "count": "횟수",
+            "type": "Fault 종류", "reset": "리셋 원인", "pc": "실행 위치 PC",
+        }
+        for column in columns:
+            self.fault_tree.heading(column, text=headings[column])
+        self.fault_tree.column("pc_time", width=175)
+        self.fault_tree.column("boot", width=55, anchor="e")
+        self.fault_tree.column("count", width=50, anchor="e")
+        self.fault_tree.column("type", width=110)
+        self.fault_tree.column("reset", width=230)
+        self.fault_tree.column("pc", width=95)
+        self.fault_tree.pack(fill="both", expand=True)
+        self.fault_tree.tag_configure("fault", foreground="#a40e26")
+        self.fault_tree.bind("<<TreeviewSelect>>", self._show_fault_detail)
+        self.fault_text = ScrolledText(fault_detail, width=48, height=16,
+                                       font=("Segoe UI", 10), wrap="word")
         self.fault_text.pack(fill="both", expand=True)
+        self.fault_text.insert("1.0", "폴트 목록에서 항목을 선택하면 상세 해설을 표시합니다.")
 
     def _build_console(self) -> None:
         pause_frame = ttk.Frame(self.console_tab)
@@ -1081,6 +1144,7 @@ class GasChangerGui(tk.Tk):
             info,
             text="• OpenOCD hot-attaches through SWD without reset, halt, flash or program commands.\n"
                  "• The GUI reconnects after a board reboot and verifies fault symbols against the exact Build ID.\n"
+                 "• TCP 연결 후 5초간 RTT 응답이 없으면 OpenOCD/ST-LINK를 자동 재연결하며 MCU reset은 수행하지 않습니다.\n"
                  "• Fast compact telemetry and slower diagnostics are polled separately; RTT drop reports automatically reduce the fast rate.\n"
                  "• Closing the GUI terminates only the OpenOCD process started by this GUI.",
             justify="left",
@@ -1088,6 +1152,7 @@ class GasChangerGui(tk.Tk):
 
     def connect(self, start_openocd: bool = True) -> None:
         self.disconnect()
+        self.manages_openocd = start_openocd
         if start_openocd:
             try:
                 self.openocd.start()
@@ -1105,6 +1170,14 @@ class GasChangerGui(tk.Tk):
             self.session.stop()
             self.session = None
         self.command_pending = False
+        self.command_sent_at = 0.0
+        self.rtt_tcp_connected_at = 0.0
+        self.last_rtt_rx_at = 0.0
+        self.rtt_responsive = False
+        self.rtt_recovery_active = False
+        self.rtt_recovery_attempts = 0
+        self.next_rtt_recovery_at = 0.0
+        self.manages_openocd = False
         self.secret_capture_active = False
         self.secret_payload = {}
         if hasattr(self, "admin_state"):
@@ -1118,14 +1191,83 @@ class GasChangerGui(tk.Tk):
         if show_outbound:
             self._append_console(f"\n> {command}\n", "outbound")
         self.command_pending = True
+        self.command_sent_at = time.monotonic()
         self.session.send(command)
 
     def _set_connection(self, connected: bool) -> None:
         self.connected = connected
-        self.connection_text.set("연결됨" if connected else "연결 끊김")
+        if connected:
+            self.rtt_tcp_connected_at = time.monotonic()
+            self.rtt_responsive = False
+            self.connection_text.set("RTT 서버 연결 · 응답 확인 중")
+            color = "#bf8700"
+        else:
+            self.rtt_tcp_connected_at = 0.0
+            self.rtt_responsive = False
+            self.connection_text.set("연결 끊김")
+            color = "#cf222e"
         self.status_dot.delete("all")
-        color = "#2da44e" if connected else "#cf222e"
         self.status_dot.create_oval(2, 2, 14, 14, fill=color, outline=color)
+
+    def _mark_rtt_activity(self) -> None:
+        self.last_rtt_rx_at = time.monotonic()
+        self.rtt_responsive = True
+        self.rtt_recovery_attempts = 0
+        self.connection_text.set("RTT 응답 정상")
+        self.status_dot.delete("all")
+        self.status_dot.create_oval(2, 2, 14, 14, fill="#2da44e", outline="#2da44e")
+
+    def _check_rtt_response(self, now: Optional[float] = None) -> None:
+        current = time.monotonic() if now is None else now
+        if (self.session is None or not self.connected or self.rtt_recovery_active or
+                not self.command_pending or self.command_sent_at <= 0.0):
+            return
+        if current - self.command_sent_at >= self.RTT_RESPONSE_TIMEOUT_S:
+            self._append_notice(
+                f"RTT 명령 응답이 {self.RTT_RESPONSE_TIMEOUT_S:.0f}초간 없어 통신 경로를 복구합니다."
+            )
+            self._recover_rtt_transport(manual=False)
+
+    def _recover_rtt_transport(self, manual: bool = False) -> None:
+        if self.session is None:
+            if manual:
+                self.connect(start_openocd=True)
+            return
+        now = time.monotonic()
+        if self.rtt_recovery_active:
+            if manual:
+                self._append_notice("ST-LINK/RTT 재연결이 이미 진행 중입니다.")
+            return
+        if not manual and now < self.next_rtt_recovery_at:
+            return
+        self.rtt_recovery_active = True
+        self.rtt_recovery_attempts += 1
+        backoff = min(
+            self.RTT_RECOVERY_MIN_INTERVAL_S * (2 ** max(self.rtt_recovery_attempts - 1, 0)),
+            60.0,
+        )
+        self.next_rtt_recovery_at = now + backoff
+        self.command_pending = False
+        self.command_sent_at = 0.0
+        self.raw_buffer = ""
+        self.prompt_probe = ""
+        self.connection_text.set("ST-LINK/RTT 재연결 중")
+        self.status_dot.delete("all")
+        self.status_dot.create_oval(2, 2, 14, 14, fill="#bf8700", outline="#bf8700")
+        self.session.force_reconnect(clear_pending=True)
+        if not self.manages_openocd:
+            self.rtt_recovery_active = False
+            self._append_notice("외부 OpenOCD 세션의 RTT TCP 연결을 다시 시도합니다.")
+            return
+        threading.Thread(target=self._restart_openocd_worker,
+                         name="rtt-openocd-recovery", daemon=True).start()
+
+    def _restart_openocd_worker(self) -> None:
+        try:
+            self.openocd.restart()
+            self.events.put(("transport_recovery", (True, "ST-LINK/OpenOCD 재연결 완료 · MCU reset 없음")))
+        except (OSError, ValueError) as error:
+            self.events.put(("transport_recovery", (False, f"ST-LINK/OpenOCD 재연결 실패: {error}")))
 
     def _set_admin_locked(self, locked: bool) -> None:
         self.admin_state.set("잠금" if locked else "잠금 해제 · 5분")
@@ -1207,14 +1349,30 @@ class GasChangerGui(tk.Tk):
                     if payload:
                         self.send_command("snapshot", show_outbound=False)
                 elif kind == "text":
+                    self._mark_rtt_activity()
                     self._process_text(str(payload))
                 elif kind == "analysis":
                     message = str(payload)
                     self._append_console(f"\n{message}\n", "analysis")
-                    self.fault_text.insert("end", message + "\n")
-                    self.fault_text.see("end")
+                    general_analysis = any(marker in message for marker in (
+                        "Exact build match", "Verified signed symbols", "Symbols unavailable",
+                        "running firmware build",
+                    ))
+                    if general_analysis and message not in self.fault_general_analysis:
+                        self.fault_general_analysis.append(message)
+                    if self.fault_records:
+                        analysis = self.fault_records[-1].setdefault("analysis", [])
+                        if isinstance(analysis, list) and message not in analysis:
+                            analysis.append(message)
+                        self._refresh_selected_fault_detail()
                 elif kind == "notice":
                     self._append_notice(str(payload))
+                elif kind == "transport_recovery":
+                    success, message = payload
+                    self.rtt_recovery_active = False
+                    self._append_notice(str(message))
+                    if not success:
+                        self._set_connection(False)
         except queue.Empty:
             pass
         self._refresh_dashboard()
@@ -1345,10 +1503,90 @@ class GasChangerGui(tk.Tk):
         interpretations = self.fault_records[-1].setdefault("interpretations", [])
         if isinstance(interpretations, list):
             interpretations.append(text)
-        self.fault_text.insert("end", "\n" + text + "\n")
-        self.fault_text.see("end")
+        self._refresh_selected_fault_detail()
+
+    @staticmethod
+    def _fault_summary(path: str, value: object) -> str:
+        lines = [line for line in format_metric(path, value).splitlines()
+                 if line and not line.startswith("원시값 ")]
+        return " / ".join(lines) if lines else "-"
+
+    def _insert_fault_record(self, record: dict[str, object]) -> None:
+        iid = f"fault-{len(self.fault_records)}"
+        record["iid"] = iid
+        self.fault_record_by_iid[iid] = record
+        data = record["data"]
+        assert isinstance(data, dict)
+        self.fault_tree.insert(
+            "", 0, iid=iid,
+            values=(
+                record["pc_time"], data.get("fault_boot", data.get("boot", "-")),
+                data.get("count", "-"), self._fault_summary("fault.type", data.get("type", 0)),
+                self._fault_summary("fault.reset_flags", data.get("reset_flags", 0)), "대기 중",
+            ),
+            tags=("fault",),
+        )
+        self.fault_tree.selection_set(iid)
+        self.fault_tree.focus(iid)
+        self.fault_tree.see(iid)
+        self._show_fault_detail()
+
+    def _update_fault_tree_record(self, record: dict[str, object]) -> None:
+        iid = str(record.get("iid", ""))
+        if not iid or not self.fault_tree.exists(iid):
+            return
+        data = record.get("data", {})
+        registers = record.get("registers", {})
+        assert isinstance(data, dict)
+        assert isinstance(registers, dict)
+        pc = registers.get("pc")
+        pc_text = f"0x{pc:08X}" if isinstance(pc, int) else "대기 중"
+        self.fault_tree.item(
+            iid,
+            values=(
+                record["pc_time"], data.get("fault_boot", data.get("boot", "-")),
+                data.get("count", "-"), self._fault_summary("fault.type", data.get("type", 0)),
+                self._fault_summary("fault.reset_flags", data.get("reset_flags", 0)), pc_text,
+            ),
+        )
+
+    def _show_fault_detail(self, _event: object = None) -> None:
+        selection = self.fault_tree.selection()
+        if not selection:
+            return
+        record = self.fault_record_by_iid.get(selection[0])
+        if record is None:
+            return
+        data = record.get("data", {})
+        assert isinstance(data, dict)
+        sections = [
+            f"발생 시각\n{record['pc_time']}\n{record['pc_time_basis']}",
+            f"Fault 종류\n{format_metric('fault.type', data.get('type', 0))}",
+            f"리셋 원인\n{format_metric('fault.reset_flags', data.get('reset_flags', 0))}",
+            f"발생 횟수\n{data.get('count', 0)}",
+        ]
+        interpretations = record.get("interpretations", [])
+        if isinstance(interpretations, list):
+            sections.extend(str(item) for item in interpretations)
+        analysis = record.get("analysis", [])
+        if isinstance(analysis, list) and analysis:
+            sections.append("심볼 및 Build 분석\n" + "\n".join(str(item) for item in analysis))
+        raw_lines = record.get("raw_lines", [])
+        if isinstance(raw_lines, list) and raw_lines:
+            sections.append("기술 원문\n" + "\n".join(str(item) for item in raw_lines))
+        self.fault_text.delete("1.0", "end")
+        self.fault_text.insert("1.0", "\n\n".join(sections))
+
+    def _refresh_selected_fault_detail(self) -> None:
+        selection = self.fault_tree.selection()
+        if selection:
+            self._show_fault_detail()
 
     def _append_fault_register_interpretation(self, values: dict[str, object]) -> None:
+        if self.fault_records:
+            record = self.fault_records[-1]
+            record["registers"] = dict(values)
+            self._update_fault_tree_record(record)
         text = (
             f"실행 위치 PC\n0x{int(values.get('pc', 0)):08X}\n\n"
             f"복귀 위치 LR\n0x{int(values.get('lr', 0)):08X}\n\n"
@@ -1360,6 +1598,8 @@ class GasChangerGui(tk.Tk):
         self._append_fault_interpretation("registers", values, text)
 
     def _append_fault_last_reset_interpretation(self, values: dict[str, object]) -> None:
+        if self.fault_records:
+            self.fault_records[-1]["last_reset"] = dict(values)
         text = (
             f"마지막 활성 IRQ\n{format_metric('fault_last_reset.irq_active', values.get('irq_active', 0))}\n\n"
             f"마지막 완료 IRQ\n{format_metric('fault_last_reset.irq_done', values.get('irq_done', 0))}\n\n"
@@ -1438,27 +1678,41 @@ class GasChangerGui(tk.Tk):
                 else:
                     fault_pc_time = datetime.now().astimezone().isoformat(timespec="milliseconds")
                     time_basis = "PC 관측 시각 · 해당 부팅의 장치 tick 미동기화"
-                record = {"pc_time": fault_pc_time, "pc_time_basis": time_basis,
-                          "data": values, "raw": line, "interpretations": []}
+                record = {
+                    "pc_time": fault_pc_time,
+                    "pc_time_basis": time_basis,
+                    "data": values,
+                    "raw": line,
+                    "raw_lines": [line],
+                    "interpretations": [],
+                    "analysis": list(self.fault_general_analysis),
+                }
                 fault_identity = (values.get("fault_boot"), values.get("count"),
                                   values.get("type"), values.get("fault_build_id"))
-                if fault_identity != self.last_fault_identity:
+                count = values.get("count", 0)
+                fault_type = values.get("type", 0)
+                has_fault = ((isinstance(count, int) and count > 0) or
+                             (isinstance(fault_type, int) and fault_type > 0))
+                if has_fault and fault_identity != self.last_fault_identity:
                     self.last_fault_identity = fault_identity
                     self.fault_records.append(record)
-                    self.fault_text.insert("end", f"[{record['pc_time']}] ({record['pc_time_basis']})\n")
-                    interpretation = (
-                        f"Fault 종류\n{format_metric('fault.type', values.get('type', 0))}\n\n"
-                        f"리셋 원인\n{format_metric('fault.reset_flags', values.get('reset_flags', 0))}\n\n"
-                        f"발생 횟수\n{values.get('count', 0)}"
-                    )
-                    record["interpretations"].append(interpretation)
-                    self.fault_text.insert("end", interpretation + "\n\n기술 원문\n" + line + "\n")
-                    self.fault_text.see("end")
+                    self._insert_fault_record(record)
                     if isinstance(values.get("count"), int) and int(values["count"]) > 0:
                         self._auto_pause_console("새 Fault 기록")
+                elif not has_fault and not self.fault_records:
+                    self.fault_text.delete("1.0", "end")
+                    self.fault_text.insert("1.0", "컨트롤러에 저장된 폴트 기록이 없습니다.")
             elif line.startswith("fault_regs "):
+                if self.fault_records:
+                    raw_lines = self.fault_records[-1].setdefault("raw_lines", [])
+                    if isinstance(raw_lines, list) and line not in raw_lines:
+                        raw_lines.append(line)
                 self._append_fault_register_interpretation(values)
             elif line.startswith("fault_last_reset "):
+                if self.fault_records:
+                    raw_lines = self.fault_records[-1].setdefault("raw_lines", [])
+                    if isinstance(raw_lines, list) and line not in raw_lines:
+                        raw_lines.append(line)
                 self._append_fault_last_reset_interpretation(values)
             if line.startswith("OK admin unlocked"):
                 self._set_admin_locked(False)
@@ -1471,6 +1725,7 @@ class GasChangerGui(tk.Tk):
 
     def _poll_tick(self) -> None:
         now = time.monotonic()
+        self._check_rtt_response(now)
         drops = self.telemetry.get("stats.output_drops", 0)
         if isinstance(drops, int) and drops > self.last_output_drops:
             self.effective_fast_interval = min(max(self.effective_fast_interval * 1.5, 0.3), 2.0)
@@ -1655,10 +1910,14 @@ class GasChangerGui(tk.Tk):
             "컨트롤러 내부에 보존된 폴트 기록은 삭제되지 않습니다.",
         ):
             return
+        for item in self.fault_tree.get_children():
+            self.fault_tree.delete(item)
         self.fault_records.clear()
+        self.fault_record_by_iid.clear()
         self.last_fault_identity = None
         self.fault_detail_signatures.clear()
         self.fault_text.delete("1.0", "end")
+        self.fault_text.insert("1.0", "폴트 목록에서 항목을 선택하면 상세 해설을 표시합니다.")
 
     def _export_events_faults(self) -> None:
         path = filedialog.asksaveasfilename(
