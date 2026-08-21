@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.log
+*.elf
+*.hex
+*.bin
+*.map
+*.list
+*.private.pem
+*.key.pem
