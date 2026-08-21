@@ -47,7 +47,7 @@ EVENT_RE = re.compile(
 )
 
 EVENT_DETAILS = {
-    "BOOT": ("Controller boot", "arg0=reset flags, arg1=boot counter"),
+    "BOOT": ("Controller boot", "arg0=boot counter, arg1=reset flags"),
     "ALARM_CHANGE": ("Alarm bitmap changed", "arg0=previous bitmap, arg1=new bitmap"),
     "VALVE_REQUEST": ("3-way valve direction requested", "arg0=direction, arg1=request reason"),
     "VALVE_OUTPUT": ("Valve drive output changed", "arg0=direction, arg1=output/power state"),
@@ -68,6 +68,199 @@ EVENT_DETAILS = {
 }
 
 EVENT_CATEGORIES = ("all", "system", "alarm", "valve", "wifi", "ethernet", "adc", "gpio", "rs485")
+
+ALARM_BITS = (
+    (0x01, "좌측 가스 EMPTY"),
+    (0x02, "우측 가스 EMPTY"),
+    (0x04, "좌측 압력센서 이상"),
+    (0x08, "우측 압력센서 이상"),
+    (0x10, "출구 압력센서 이상"),
+    (0x20, "좌측 밸브 이상"),
+    (0x40, "우측 밸브 이상"),
+)
+CHECK_BITS = (
+    (0x01, "유효 OPEN 피드백 없음"),
+    (0x02, "LEFT/RIGHT 피드백 동시 입력"),
+    (0x04, "두 밸브 포트 동시 입력"),
+    (0x08, "밸브 명령 피드백 시간초과"),
+)
+TASK_STALL_BITS = (
+    (0x01, "RS485 Task 정지"),
+    (0x02, "Segment/Watchdog Task 정지"),
+    (0x04, "ADC Task 정지"),
+    (0x08, "Valve Task 정지"),
+    (0x10, "Wi-Fi RX Task 정지"),
+)
+TASK_CREATE_BITS = tuple(
+    (1 << index, f"{name} Task 생성 실패")
+    for index, name in enumerate((
+        "Default", "Wi-Fi TX", "Wi-Fi RX", "Segment", "ADC", "Gas",
+        "Key", "GPIO", "Valve", "UART", "Ethernet/WIZ", "RTT",
+    ))
+)
+RESET_FLAG_BITS = (
+    (0x04000000, "외부 RESET 핀"),
+    (0x08000000, "전원 투입/전원강하(POR/PDR)"),
+    (0x10000000, "소프트웨어 리셋"),
+    (0x20000000, "독립 Watchdog(IWDG)"),
+    (0x40000000, "Window Watchdog(WWDG)"),
+    (0x80000000, "저전력 모드 리셋"),
+)
+CFSR_BITS = (
+    (1 << 0, "명령어 접근 위반"), (1 << 1, "데이터 접근 위반"),
+    (1 << 3, "예외 복귀 중 MemManage 오류"), (1 << 4, "예외 진입 중 MemManage 오류"),
+    (1 << 5, "Lazy FP 상태 보존 오류"), (1 << 7, "MMFAR 주소 유효"),
+    (1 << 8, "명령어 Bus 오류"), (1 << 9, "정확한 데이터 Bus 오류"),
+    (1 << 10, "지연 데이터 Bus 오류"), (1 << 11, "예외 복귀 중 Bus 오류"),
+    (1 << 12, "예외 진입 중 Bus 오류"), (1 << 13, "Lazy FP Bus 오류"),
+    (1 << 15, "BFAR 주소 유효"), (1 << 16, "정의되지 않은 명령어"),
+    (1 << 17, "잘못된 CPU 상태"), (1 << 18, "잘못된 예외 복귀 PC"),
+    (1 << 19, "Coprocessor 미지원"), (1 << 24, "비정렬 메모리 접근"),
+    (1 << 25, "0으로 나눔"),
+)
+HFSR_BITS = (
+    (1 << 1, "벡터 테이블 읽기 오류"),
+    (1 << 30, "하위 Fault가 HardFault로 승격"),
+    (1 << 31, "디버그 이벤트"),
+)
+VALVE_EVENT_PATH_BITS = ((0x01, "Wi-Fi"), (0x02, "Ethernet"))
+ADC_VALID_BITS = ((0x01, "LEFT ADC 유효"), (0x02, "RIGHT ADC 유효"), (0x04, "OUT ADC 유효"))
+
+ENUM_PATHS: dict[str, dict[int, str]] = {
+    "wifi.link": {0: "연결 끊김", 1: "연결됨"},
+    "wifi.connecting": {0: "연결 작업 없음", 1: "연결 진행 중"},
+    "wifi.led": {0: "꺼짐/재부팅", 1: "접속 대기 점멸", 2: "접속 진행 점멸", 3: "연결 완료 점등"},
+    "wifi.event": {0: "전송 없음", 1: "전송 대기", 2: "전송 성공", 3: "전송 실패"},
+    "ethernet.event": {0: "전송 없음", 1: "전송 대기", 2: "전송 성공", 3: "전송 실패"},
+    "ethernet.phy": {0: "링크 끊김", 1: "링크 연결됨"},
+    "ethernet.enable": {0: "비활성", 1: "활성"},
+    "ethernet.dhcp": {1: "고정 IP", 2: "DHCP"},
+    "config_eth.dhcp": {1: "고정 IP", 2: "DHCP"},
+    "config.pressure_mode": {0: "160 bar 모드", 1: "40 bar 모드"},
+    "sensor_limits.mode": {0: "160 bar 모드", 1: "40 bar 모드"},
+    "io_inputs.dip_pressure": {0: "160 bar 모드", 1: "40 bar 모드"},
+    "status.run": {
+        0: "초기/Idle", 1: "미사용 Manual LEFT", 2: "미사용 Manual RIGHT",
+        3: "자동 운전", 4: "정지", 5: "ECO LEFT", 6: "ECO RIGHT",
+        7: "Wi-Fi 설정", 8: "Reset",
+    },
+    "io_inputs.run": {
+        0: "초기/Idle", 1: "미사용 Manual LEFT", 2: "미사용 Manual RIGHT",
+        3: "자동 운전", 4: "정지", 5: "ECO LEFT", 6: "ECO RIGHT",
+        7: "Wi-Fi 설정", 8: "Reset",
+    },
+    "fault.type": {0: "Fault 없음", 1: "HardFault", 2: "Stack Overflow", 3: "Heap/Malloc 실패", 4: "Assert"},
+    "fault_last_reset.irq_active": {
+        0: "활성 IRQ 없음", 1: "Wi-Fi UART5", 2: "I2C Event", 3: "I2C Error",
+        4: "GPIO EXTI", 5: "TIM7", 6: "TIM5", 7: "I2C DMA TX", 8: "I2C DMA RX",
+    },
+    "fault_last_reset.irq_done": {
+        0: "완료 IRQ 없음", 1: "Wi-Fi UART5", 2: "I2C Event", 3: "I2C Error",
+        4: "GPIO EXTI", 5: "TIM7", 6: "TIM5", 7: "I2C DMA TX", 8: "I2C DMA RX",
+    },
+    "rs485_tx.last_status": {0: "정상", 1: "오류", 2: "Busy", 3: "Timeout"},
+    "io_i2c.last_status": {0: "정상", 1: "오류", 2: "Busy", 3: "Timeout"},
+}
+
+BITMASK_PATHS = {
+    "status.alarm": ALARM_BITS, "telemetry.alarm": ALARM_BITS, "alarm.current": ALARM_BITS,
+    "status.check": CHECK_BITS, "telemetry.check": CHECK_BITS, "valve.check": CHECK_BITS,
+    "status.task_stall": TASK_STALL_BITS, "rtos.stall": TASK_STALL_BITS,
+    "rtos.create_fail": TASK_CREATE_BITS, "fault.reset_flags": RESET_FLAG_BITS,
+    "fault_regs.cfsr": CFSR_BITS, "fault_regs.hfsr": HFSR_BITS,
+    "check_bits.wait": VALVE_EVENT_PATH_BITS, "check_bits.done": VALVE_EVENT_PATH_BITS,
+    "check_bits.failed": VALVE_EVENT_PATH_BITS,
+}
+
+BOOLEAN_PATHS = {
+    "status.sensor_ready", "sensor.ready", "wifi.configured", "ethernet.dhcp_ok",
+    "telemetry_eco.enable", "telemetry_eco.active", "telemetry_eco.stop",
+    "telemetry_eco.left_enabled", "telemetry_eco.right_enabled",
+    "valve.power", "valve.pending", "io.output_power",
+    "io_inputs.stop", "io_inputs.menu", "io_inputs.up", "io_inputs.down", "io_inputs.enter",
+    "io_inputs.contact1", "io_inputs.contact2",
+}
+
+GAS_STATUS_NAMES = {
+    1: "SERVICE(실제 공급측)", 2: "밸브 Fault", 3: "READY(대기)",
+    4: "EMPTY(가스 부족)", 5: "ECO SERVICE", 6: "밸브 Close Fault",
+}
+
+
+def decode_bitmask(value: object, definitions: tuple[tuple[int, str], ...], zero: str = "정상/해당 없음") -> str:
+    if not isinstance(value, int):
+        return str(value)
+    names = [label for mask, label in definitions if value & mask]
+    known_mask = 0
+    for mask, _label in definitions:
+        known_mask |= mask
+    unknown = value & ~known_mask
+    if unknown:
+        names.append(f"미정의 비트 0x{unknown:08X}")
+    return f"{' | '.join(names) if names else zero} (0x{value:08X})"
+
+
+def decode_enum(value: object, labels: dict[int, str]) -> str:
+    if not isinstance(value, int):
+        return str(value)
+    return f"{labels.get(value, '알 수 없는 값')} ({value})"
+
+
+def format_metric(path: str, value: object) -> str:
+    """Return a human-readable interpretation while retaining the raw value."""
+    if path in BITMASK_PATHS:
+        return decode_bitmask(value, BITMASK_PATHS[path])
+    if path in ENUM_PATHS:
+        return decode_enum(value, ENUM_PATHS[path])
+    if path in BOOLEAN_PATHS and isinstance(value, int):
+        return f"{'활성/예' if value else '비활성/아니오'} ({value})"
+    if path in ("config.wifi", "config_core.wifi_active") and isinstance(value, int):
+        return f"{'Wi-Fi 활성' if value == 1000 else 'Wi-Fi 비활성'} ({value})"
+    if path in ("sensor_limits.gas", "sensor_limits.pressure_state") and isinstance(value, list):
+        return "[" + ", ".join(decode_enum(item, GAS_STATUS_NAMES) for item in value) + "]"
+    if path == "wifi_rx.last_error":
+        return decode_bitmask(value, ((0x01, "Parity"), (0x02, "Noise"), (0x04, "Frame"),
+                                      (0x08, "Overrun"), (0x10, "DMA")))
+    return str(value)
+
+
+def _hex_int(value: object) -> int:
+    try:
+        return int(str(value), 16) if str(value).lower().startswith("0x") else int(str(value))
+    except ValueError:
+        return 0
+
+
+def interpret_event_arguments(name: str, arg0: object, arg1: object) -> str:
+    first = _hex_int(arg0)
+    second = _hex_int(arg1)
+    direction = {0: "UNKNOWN", 1: "LEFT", 2: "RIGHT"}
+    link = {0: "연결 끊김", 1: "연결됨", 0xFF: "초기값/알 수 없음"}
+    if name == "BOOT":
+        return f"부팅 횟수={first}; 리셋 원인={decode_bitmask(second, RESET_FLAG_BITS)}"
+    if name == "ALARM_CHANGE":
+        return f"이전={decode_bitmask(first, ALARM_BITS)}\n현재={decode_bitmask(second, ALARM_BITS)}"
+    if name in ("WIFI_LINK", "ETH_LINK"):
+        return f"이전={link.get(first, f'알 수 없음({first})')} → 현재={link.get(second, f'알 수 없음({second})')}"
+    if name in ("VALVE_REQUEST", "VALVE_FEEDBACK"):
+        return f"방향={direction.get(first, f'알 수 없음({first})')}; 요청 방향={direction.get(second, f'알 수 없음({second})')}"
+    if name == "VALVE_OUTPUT":
+        return f"구동 방향={direction.get(first, f'알 수 없음({first})')}; GPIO 출력 마스크=0x{second:08X}"
+    if name in ("CHECK_SET", "CHECK_CLEAR"):
+        return f"CHECK={decode_bitmask(first, CHECK_BITS)}\n전체 CHECK={decode_bitmask(second, CHECK_BITS)}"
+    if name == "SWITCH_BEGIN":
+        return f"전환 목표={direction.get(first, f'알 수 없음({first})')}; 통신 대기={decode_bitmask(second, VALVE_EVENT_PATH_BITS)}"
+    if name == "SWITCH_DONE":
+        return f"완료 경로={decode_bitmask(first, VALVE_EVENT_PATH_BITS)}; 실패 경로={decode_bitmask(second, VALVE_EVENT_PATH_BITS)}"
+    if name == "ADC_VALID_CHANGE":
+        return f"이전={decode_bitmask(first, ADC_VALID_BITS)}\n현재={decode_bitmask(second, ADC_VALID_BITS)}"
+    if name == "GPIO_HEALTH":
+        return f"GPIO 상태={'정상/복구' if first else '통신 이상'}; 진단 카운터={second}"
+    if name == "GPIO_RECOVERY":
+        return f"복구 결과={'성공' if first else '실패'}; 재초기화 횟수={second}"
+    if name == "ETH_INIT":
+        return f"초기화={'성공' if first else '실패'}; DHCP/실패 사유 코드={second}"
+    return f"arg0=0x{first:08X} ({first}); arg1=0x{second:08X} ({second})"
 
 
 def _convert_scalar(value: str) -> object:
@@ -499,6 +692,7 @@ class GasChangerGui(tk.Tk):
         self.event_record_by_iid: dict[str, dict[str, object]] = {}
         self.fault_records: list[dict[str, object]] = []
         self.last_fault_identity: tuple[object, ...] | None = None
+        self.fault_detail_signatures: set[tuple[object, ...]] = set()
         self.console_paused = tk.BooleanVar(value=False)
         self.console_auto_pause = tk.BooleanVar(value=True)
         self.console_pause_text = tk.StringVar(value="Pause display")
@@ -605,14 +799,14 @@ class GasChangerGui(tk.Tk):
         self.health_tree.heading("detail", text="Detail")
         self.health_tree.column("name", width=130)
         self.health_tree.column("state", width=90, anchor="center")
-        self.health_tree.column("detail", width=230)
+        self.health_tree.column("detail", width=430)
         self.health_tree.pack(fill="both", expand=True)
         self.detail_tree = ttk.Treeview(detail_frame, columns=("value", "updated"), show="tree headings")
         self.detail_tree.heading("#0", text="Variable")
         self.detail_tree.heading("value", text="Value")
         self.detail_tree.heading("updated", text="Updated")
         self.detail_tree.column("#0", width=300)
-        self.detail_tree.column("value", width=240)
+        self.detail_tree.column("value", width=480)
         self.detail_tree.column("updated", width=100)
         self.detail_tree.pack(fill="both", expand=True)
 
@@ -632,7 +826,7 @@ class GasChangerGui(tk.Tk):
         self.watch_tree.heading("age", text="Age")
         self.watch_tree.column("#0", width=170)
         self.watch_tree.column("enabled", width=45, anchor="center")
-        self.watch_tree.column("value", width=110, anchor="e")
+        self.watch_tree.column("value", width=260, anchor="w")
         self.watch_tree.column("unit", width=80)
         self.watch_tree.column("age", width=70, anchor="e")
         self.watch_tree.pack(fill="both", expand=True)
@@ -1010,6 +1204,7 @@ class GasChangerGui(tk.Tk):
             "code": int(code_text), "category": category,
             "name": name, "summary": title, "argument0": arg0, "argument1": arg1,
             "meaning": argument_help,
+            "interpretation": interpret_event_arguments(name, arg0, arg1),
         }
         self.event_records.append(record)
         self.event_record_by_iid[identity] = record
@@ -1018,6 +1213,38 @@ class GasChangerGui(tk.Tk):
             self.event_tree.insert("", 0, iid=identity, values=(record["pc_time"], category,
                 name, title, tick, sequence))
         return True
+
+    def _append_fault_interpretation(self, kind: str, values: dict[str, object], text: str) -> None:
+        if self.last_fault_identity is None or not self.fault_records:
+            return
+        signature = (self.last_fault_identity, kind, tuple(sorted(values.items())))
+        if signature in self.fault_detail_signatures:
+            return
+        self.fault_detail_signatures.add(signature)
+        interpretations = self.fault_records[-1].setdefault("interpretations", [])
+        if isinstance(interpretations, list):
+            interpretations.append(text)
+        self.fault_text.insert("end", "[사람이 읽는 해석]\n" + text + "\n")
+        self.fault_text.see("end")
+
+    def _append_fault_register_interpretation(self, values: dict[str, object]) -> None:
+        text = (
+            f"실행 위치 PC=0x{int(values.get('pc', 0)):08X}, 복귀 위치 LR=0x{int(values.get('lr', 0)):08X}\n"
+            f"CFSR: {format_metric('fault_regs.cfsr', values.get('cfsr', 0))}\n"
+            f"HFSR: {format_metric('fault_regs.hfsr', values.get('hfsr', 0))}\n"
+            f"Fault 주소: BFAR=0x{int(values.get('bfar', 0)):08X}, MMFAR=0x{int(values.get('mmfar', 0)):08X}"
+        )
+        self._append_fault_interpretation("registers", values, text)
+
+    def _append_fault_last_reset_interpretation(self, values: dict[str, object]) -> None:
+        text = (
+            f"마지막 활성 IRQ: {format_metric('fault_last_reset.irq_active', values.get('irq_active', 0))}\n"
+            f"마지막 완료 IRQ: {format_metric('fault_last_reset.irq_done', values.get('irq_done', 0))}\n"
+            f"CPU 예외번호(IPSR)={values.get('ipsr', 0)}, 인터럽트 마스크(PRIMASK/BASEPRI/FAULTMASK)="
+            f"{values.get('primask', 0)}/{values.get('basepri', 0)}/{values.get('faultmask', 0)}\n"
+            f"리셋 직전 storm: Wi-Fi={values.get('wifi_storm', 0)}, GPIO EXTI={values.get('exti_storm', 0)}"
+        )
+        self._append_fault_interpretation("last_reset", values, text)
 
     def _process_text(self, text: str) -> None:
         prompt_stream = self.prompt_probe + text
@@ -1085,7 +1312,7 @@ class GasChangerGui(tk.Tk):
                     fault_pc_time = datetime.now().astimezone().isoformat(timespec="milliseconds")
                     time_basis = "PC observation time (fault boot was not synchronized)"
                 record = {"pc_time": fault_pc_time, "pc_time_basis": time_basis,
-                          "data": values, "raw": line}
+                          "data": values, "raw": line, "interpretations": []}
                 fault_identity = (values.get("fault_boot"), values.get("count"),
                                   values.get("type"), values.get("fault_build_id"))
                 if fault_identity != self.last_fault_identity:
@@ -1093,9 +1320,20 @@ class GasChangerGui(tk.Tk):
                     self.fault_records.append(record)
                     self.fault_text.insert("end", f"[{record['pc_time']}] ({record['pc_time_basis']})\n")
                     self.fault_text.insert("end", line + "\n")
+                    interpretation = (
+                        f"리셋 원인: {format_metric('fault.reset_flags', values.get('reset_flags', 0))}\n"
+                        f"Fault 종류: {format_metric('fault.type', values.get('type', 0))}\n"
+                        f"발생 횟수: {values.get('count', 0)}"
+                    )
+                    record["interpretations"].append(interpretation)
+                    self.fault_text.insert("end", "[사람이 읽는 해석]\n" + interpretation + "\n")
                     self.fault_text.see("end")
                     if isinstance(values.get("count"), int) and int(values["count"]) > 0:
                         self._auto_pause_console("new Fault record")
+            elif line.startswith("fault_regs "):
+                self._append_fault_register_interpretation(values)
+            elif line.startswith("fault_last_reset "):
+                self._append_fault_last_reset_interpretation(values)
             if line.startswith("OK admin unlocked"):
                 self.admin_state.set("Unlocked (5 min)")
                 self.admin_password.set("")
@@ -1134,7 +1372,11 @@ class GasChangerGui(tk.Tk):
         self.card_vars["service"].set(str(service))
         self.card_vars["valve"].set(f"{get('valve.output')} / {get('valve.feedback')}")
         alarm = get("telemetry.alarm", get("status.alarm"))
-        self.card_vars["alarm"].set(f"0x{alarm:08X}" if isinstance(alarm, int) else str(alarm))
+        if isinstance(alarm, int):
+            alarm_count = sum(1 for mask, _label in ALARM_BITS if alarm & mask)
+            self.card_vars["alarm"].set("정상" if alarm_count == 0 else f"{alarm_count}개 활성")
+        else:
+            self.card_vars["alarm"].set(str(alarm))
         for key, index in (("left", 0), ("right", 1), ("out", 2)):
             fast_path = {0: "telemetry.left_pressure_tenths",
                          1: "telemetry.right_pressure_tenths",
@@ -1150,15 +1392,22 @@ class GasChangerGui(tk.Tk):
             else:
                 eco_text = str(seconds)
             self.card_vars[f"{side}_eco"].set(eco_text)
-        self.card_vars["wifi"].set("UP" if get("wifi.link", 0) == 1 else "DOWN")
-        self.card_vars["ethernet"].set("UP" if get("ethernet.phy", 0) == 1 else "DOWN")
+        self.card_vars["wifi"].set(format_metric("wifi.link", get("wifi.link", 0)))
+        self.card_vars["ethernet"].set(format_metric("ethernet.phy", get("ethernet.phy", 0)))
+        check_value = get("status.check", get("telemetry.check", 0))
         health = (
-            ("Valve feedback", "CHECK" if get("status.check", 0) else "OK", f"service={get('status.service')}, check={get('status.check')}"),
+            ("Valve feedback", "CHECK" if check_value else "OK",
+             f"service={get('status.service')}, {format_metric('status.check', check_value)}"),
             ("Pressure ADC", "OK" if get("status.sensor_ready", 0) else "STARTING", f"raw={get('sensor.dma_raw')}"),
-            ("Wi-Fi", "UP" if get("wifi.link", 0) else "DOWN", f"configured={get('wifi.configured')}, connecting={get('wifi.connecting')}"),
-            ("Ethernet", "UP" if get("ethernet.phy", 0) else "DOWN", f"ip={get('ethernet.ip')}"),
+            ("Alarm", "OK" if isinstance(alarm, int) and alarm == 0 else
+             ("ACTIVE" if isinstance(alarm, int) else "UNKNOWN"), format_metric("status.alarm", alarm)),
+            ("Wi-Fi", "UP" if get("wifi.link", 0) else "DOWN",
+             f"{format_metric('wifi.link', get('wifi.link', 0))}; LED={format_metric('wifi.led', get('wifi.led', 0))}"),
+            ("Ethernet", "UP" if get("ethernet.phy", 0) else "DOWN",
+             f"{format_metric('ethernet.phy', get('ethernet.phy', 0))}; IP={get('ethernet.ip')}"),
             ("RS485", "OK", f"frames={get('rs485.frames')}, crc_bad={get('rs485.crc_bad')}"),
-            ("RTOS", "OK" if get("status.task_stall", 0) == 0 else "STALL", f"stall={get('status.task_stall')}"),
+            ("RTOS", "OK" if get("status.task_stall", 0) == 0 else "STALL",
+             format_metric("status.task_stall", get("status.task_stall", 0))),
         )
         for item in self.health_tree.get_children():
             self.health_tree.delete(item)
@@ -1172,14 +1421,14 @@ class GasChangerGui(tk.Tk):
             if "[" in path:
                 continue
             age = time.time() - self.telemetry.updated(path)
-            self.detail_tree.insert("", "end", text=path, values=(str(value), f"{age:.1f}s"))
+            self.detail_tree.insert("", "end", text=path, values=(format_metric(path, value), f"{age:.1f}s"))
 
     @staticmethod
     def _display_watch(definition: WatchDefinition, raw: object) -> str:
         if isinstance(raw, (int, float)):
             value = raw / definition.divisor
-            return f"{value:.1f}" if definition.divisor != 1.0 else str(raw)
-        return str(raw)
+            return f"{value:.1f}" if definition.divisor != 1.0 else format_metric(definition.path, raw)
+        return format_metric(definition.path, raw)
 
     def _refresh_watch(self) -> None:
         timestamp = time.time()
@@ -1242,7 +1491,8 @@ class GasChangerGui(tk.Tk):
             f"Sequence: {record['sequence']}\n\n"
             f"Meaning\n{record['summary']}\n\n"
             f"Arguments\n{record['meaning']}\n"
-            f"arg0={record['argument0']}\narg1={record['argument1']}"
+            f"arg0={record['argument0']}\narg1={record['argument1']}\n\n"
+            f"사람이 읽는 해석\n{record['interpretation']}"
         )
         self.event_detail_text.delete("1.0", "end")
         self.event_detail_text.insert("1.0", detail)
@@ -1260,6 +1510,7 @@ class GasChangerGui(tk.Tk):
         self.event_record_by_iid.clear()
         self.fault_records.clear()
         self.last_fault_identity = None
+        self.fault_detail_signatures.clear()
         self.event_detail_text.delete("1.0", "end")
         self.fault_text.delete("1.0", "end")
 
@@ -1279,10 +1530,12 @@ class GasChangerGui(tk.Tk):
                 for event in self.event_records:
                     writer.writerow(("event", event["pc_time"], event["boot"], event["category"], event["name"],
                                      event["summary"], event["device_tick_ms"], event["sequence"],
-                                     event["argument0"], event["argument1"], event["meaning"]))
+                                     event["argument0"], event["argument1"],
+                                     f"{event['meaning']} | {event.get('interpretation', '')}"))
                 for fault in self.fault_records:
                     writer.writerow(("fault", fault["pc_time"], fault["data"].get("boot", ""), "FAULT", "FAULT", fault["raw"],
-                                     fault["data"].get("fault_snapshot_tick", ""), "", "", "", fault["pc_time_basis"]))
+                                     fault["data"].get("fault_snapshot_tick", ""), "", "", "",
+                                     fault["pc_time_basis"] + " | " + " | ".join(fault.get("interpretations", []))))
         else:
             payload = {"exported_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                        "events": self.event_records, "faults": self.fault_records}
