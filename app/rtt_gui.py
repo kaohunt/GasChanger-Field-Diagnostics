@@ -462,7 +462,7 @@ class LiveChart(ttk.Frame):
 class GasChangerGui(tk.Tk):
     SLOW_POLL_COMMANDS = (
         "wifi detail", "ethernet", "rtos", "io", "rs485", "watchdog",
-        "config all", "fault", "stats", "admin status",
+        "config all", "fault", "events all 32", "stats", "admin status",
     )
 
     def __init__(self, args: argparse.Namespace) -> None:
@@ -499,6 +499,16 @@ class GasChangerGui(tk.Tk):
         self.event_record_by_iid: dict[str, dict[str, object]] = {}
         self.fault_records: list[dict[str, object]] = []
         self.last_fault_identity: tuple[object, ...] | None = None
+        self.console_paused = tk.BooleanVar(value=False)
+        self.console_auto_pause = tk.BooleanVar(value=True)
+        self.console_pause_text = tk.StringVar(value="Pause display")
+        self.console_pause_status = tk.StringVar(value="LIVE · background capture active")
+        self.console_pause_buffer: deque[tuple[str, Optional[str]]] = deque(maxlen=4096)
+        self.console_pause_dropped = 0
+        self.console_pause_reason = ""
+        self.firmware_identity = tk.StringVar(value="Not read — press Read version")
+        self.firmware_build_detail = tk.StringVar(value="Build/source details will appear here")
+        self.firmware_source_detail = tk.StringVar(value="")
         self.host = tk.StringVar(value=args.host)
         self.port = tk.IntVar(value=args.port)
         self.connection_text = tk.StringVar(value="Disconnected")
@@ -642,13 +652,20 @@ class GasChangerGui(tk.Tk):
         toolbar.pack(fill="x", pady=(0, 8))
         ttk.Label(toolbar, text="Category").pack(side="left")
         self.event_category = tk.StringVar(value="all")
-        ttk.Combobox(toolbar, textvariable=self.event_category, values=EVENT_CATEGORIES,
-                     state="readonly", width=12).pack(side="left", padx=6)
-        ttk.Button(toolbar, text="Refresh 32", command=self._refresh_events).pack(side="left")
+        category_box = ttk.Combobox(toolbar, textvariable=self.event_category, values=EVENT_CATEGORIES,
+                                    state="readonly", width=12)
+        category_box.pack(side="left", padx=6)
+        category_box.bind("<<ComboboxSelected>>", self._apply_event_filter)
+        ttk.Button(toolbar, text="Refresh all 32", command=self._refresh_events).pack(side="left")
         ttk.Button(toolbar, text="Read fault", command=lambda: self.send_command("fault")).pack(side="left", padx=6)
         ttk.Button(toolbar, text="Read version", command=lambda: self.send_command("version")).pack(side="left")
         ttk.Button(toolbar, text="Clear view", command=self._clear_events_faults).pack(side="right")
         ttk.Button(toolbar, text="Export", command=self._export_events_faults).pack(side="right", padx=6)
+        identity = ttk.LabelFrame(self.events_tab, text="Firmware identity (fault correlation)", padding=(8, 5))
+        identity.pack(fill="x", pady=(0, 8))
+        ttk.Label(identity, textvariable=self.firmware_identity, style="Status.TLabel").pack(anchor="w")
+        ttk.Label(identity, textvariable=self.firmware_build_detail, foreground="#57606a").pack(anchor="w")
+        ttk.Label(identity, textvariable=self.firmware_source_detail, foreground="#57606a").pack(anchor="w")
         event_pane = ttk.Panedwindow(self.events_tab, orient="horizontal")
         event_pane.pack(fill="both", expand=True)
         event_list = ttk.Frame(event_pane)
@@ -678,6 +695,15 @@ class GasChangerGui(tk.Tk):
         self.fault_text.pack(fill="both", expand=True)
 
     def _build_console(self) -> None:
+        pause_frame = ttk.Frame(self.console_tab)
+        pause_frame.pack(fill="x", pady=(0, 7))
+        ttk.Button(pause_frame, textvariable=self.console_pause_text,
+                   command=self._toggle_console_pause).pack(side="left")
+        ttk.Checkbutton(pause_frame, text="Auto-pause on new Fault / CHECK",
+                        variable=self.console_auto_pause).pack(side="left", padx=8)
+        ttk.Button(pause_frame, text="Discard buffered", command=self._discard_console_buffer).pack(side="left")
+        ttk.Label(pause_frame, textvariable=self.console_pause_status,
+                  style="Status.TLabel").pack(side="right")
         command_frame = ttk.Frame(self.console_tab)
         command_frame.pack(fill="x", pady=(0, 7))
         ttk.Label(command_frame, text="Command", style="Status.TLabel").pack(side="left")
@@ -687,7 +713,7 @@ class GasChangerGui(tk.Tk):
         self.command_entry.bind("<Up>", lambda _event: self._history(-1))
         self.command_entry.bind("<Down>", lambda _event: self._history(1))
         ttk.Button(command_frame, text="Send ↵", command=self._send_console).pack(side="left")
-        ttk.Button(command_frame, text="Clear console", command=lambda: self.console.delete("1.0", "end")).pack(side="left", padx=(6, 0))
+        ttk.Button(command_frame, text="Clear visible", command=lambda: self.console.delete("1.0", "end")).pack(side="left", padx=(6, 0))
         self.console = ScrolledText(self.console_tab, bg="#0d1117", fg="#c9d1d9", insertbackground="white", font=("Consolas", 10), wrap="word")
         self.console.pack(fill="both", expand=True)
 
@@ -799,6 +825,15 @@ class GasChangerGui(tk.Tk):
         self.status_dot.create_oval(2, 2, 14, 14, fill=color, outline=color)
 
     def _append_console(self, text: str, tag: Optional[str] = None) -> None:
+        if self.console_paused.get():
+            if len(self.console_pause_buffer) == self.console_pause_buffer.maxlen:
+                self.console_pause_dropped += 1
+            self.console_pause_buffer.append((text, tag))
+            self._update_console_pause_status()
+            return
+        self._append_console_direct(text, tag)
+
+    def _append_console_direct(self, text: str, tag: Optional[str] = None) -> None:
         if tag == "analysis":
             self.console.tag_configure("analysis", foreground="#58a6ff")
         elif tag == "notice":
@@ -807,6 +842,45 @@ class GasChangerGui(tk.Tk):
             self.console.tag_configure("outbound", foreground="#8b949e")
         self.console.insert("end", text, tag or "")
         self.console.see("end")
+
+    def _update_console_pause_status(self) -> None:
+        if not self.console_paused.get():
+            self.console_pause_status.set("LIVE · background capture active")
+            return
+        buffered = len(self.console_pause_buffer)
+        dropped = f" · {self.console_pause_dropped} old chunks dropped" if self.console_pause_dropped else ""
+        reason_text = f" · {self.console_pause_reason}" if self.console_pause_reason else ""
+        self.console_pause_status.set(
+            f"PAUSED{reason_text} · {buffered} chunks buffered{dropped} · parsing continues"
+        )
+
+    def _set_console_paused(self, paused: bool, reason: str = "") -> None:
+        if paused:
+            self.console_paused.set(True)
+            self.console_pause_reason = reason
+            self.console_pause_text.set("Resume + show buffered")
+            self._update_console_pause_status()
+            return
+        self.console_paused.set(False)
+        self.console_pause_reason = ""
+        self.console_pause_text.set("Pause display")
+        while self.console_pause_buffer:
+            text, tag = self.console_pause_buffer.popleft()
+            self._append_console_direct(text, tag)
+        self.console_pause_dropped = 0
+        self._update_console_pause_status()
+
+    def _toggle_console_pause(self) -> None:
+        self._set_console_paused(not self.console_paused.get(), "manual" if not self.console_paused.get() else "")
+
+    def _auto_pause_console(self, reason: str) -> None:
+        if self.console_auto_pause.get() and not self.console_paused.get():
+            self._set_console_paused(True, f"auto: {reason}")
+
+    def _discard_console_buffer(self) -> None:
+        self.console_pause_buffer.clear()
+        self.console_pause_dropped = 0
+        self._update_console_pause_status()
 
     def _append_notice(self, text: str) -> None:
         self._append_console(f"\n[GUI] {text}\n", "notice")
@@ -898,7 +972,26 @@ class GasChangerGui(tk.Tk):
             return datetime.now().astimezone().isoformat(timespec="milliseconds")
         return datetime.fromtimestamp(anchor + tick / 1000.0).astimezone().isoformat(timespec="milliseconds")
 
-    def _add_event_line(self, line: str, match: re.Match[str]) -> None:
+    def _insert_event_record(self, identity: str, record: dict[str, object]) -> None:
+        self.event_tree.insert("", "end", iid=identity, values=(record["pc_time"], record["category"],
+            record["name"], record["summary"], record["device_tick_ms"], record["sequence"]))
+
+    def _apply_event_filter(self, _event: object = None) -> None:
+        for item in self.event_tree.get_children():
+            self.event_tree.delete(item)
+        self.event_detail_text.delete("1.0", "end")
+        selected = self.event_category.get().upper()
+        records = sorted(
+            self.event_record_by_iid.items(),
+            key=lambda item: (int(item[1]["boot"]), int(item[1]["sequence"]),
+                              int(item[1]["device_tick_ms"])),
+            reverse=True,
+        )
+        for identity, record in records:
+            if selected == "ALL" or str(record["category"]).upper() == selected:
+                self._insert_event_record(identity, record)
+
+    def _add_event_line(self, line: str, match: re.Match[str]) -> bool:
         tick_text, code_text, name, arg0, arg1 = match.groups()
         fields = parse_key_values(line)
         tick = int(tick_text)
@@ -906,8 +999,8 @@ class GasChangerGui(tk.Tk):
         category = str(fields.get("category", "UNKNOWN"))
         identity = (f"event-{self.event_response_boot}-{sequence}" if sequence else
                     f"event-{self.event_response_boot}-{tick_text}-{code_text}-{arg0}-{arg1}")
-        if self.event_tree.exists(identity):
-            return
+        if identity in self.event_record_by_iid:
+            return False
         title, argument_help = EVENT_DETAILS.get(name, ("Firmware diagnostic event", "See firmware release notes for argument semantics"))
         record = {
             "pc_time": self._pc_time_for_tick(tick, self.event_response_boot),
@@ -920,8 +1013,11 @@ class GasChangerGui(tk.Tk):
         }
         self.event_records.append(record)
         self.event_record_by_iid[identity] = record
-        self.event_tree.insert("", 0, iid=identity, values=(record["pc_time"], category,
-            name, title, tick, sequence))
+        selected = self.event_category.get().upper()
+        if selected == "ALL" or category.upper() == selected:
+            self.event_tree.insert("", 0, iid=identity, values=(record["pc_time"], category,
+                name, title, tick, sequence))
+        return True
 
     def _process_text(self, text: str) -> None:
         prompt_stream = self.prompt_probe + text
@@ -961,7 +1057,24 @@ class GasChangerGui(tk.Tk):
                     self.event_response_boot = int(values["boot"])
             event_match = EVENT_RE.search(line)
             if event_match:
-                self._add_event_line(line, event_match)
+                event_added = self._add_event_line(line, event_match)
+                if event_added and event_match.group(3) == "CHECK_SET":
+                    self._auto_pause_console("CHECK asserted")
+            if line.startswith("fw_product="):
+                git_value = str(values.get("git", ""))[:12]
+                dirty = " dirty" if values.get("dirty", 0) else ""
+                self.firmware_identity.set(
+                    f"{values.get('fw_product', '-')} · HW {values.get('hw_revision', '-')} · "
+                    f"FW {values.get('fw_version', '-')} · Build {values.get('build_id', '-')}"
+                )
+                self.firmware_build_detail.set(
+                    f"Git {git_value}{dirty} · {values.get('config', '-')}"
+                )
+            elif line.startswith("source_id="):
+                self.firmware_source_detail.set(
+                    f"Source {values.get('source_id', '-')} · Built {values.get('build_utc', '-')} · "
+                    f"Compiler {values.get('compiler', '-')}"
+                )
             if line.startswith("fault "):
                 fault_boot = values.get("fault_boot")
                 snapshot_tick = values.get("fault_snapshot_tick")
@@ -981,6 +1094,8 @@ class GasChangerGui(tk.Tk):
                     self.fault_text.insert("end", f"[{record['pc_time']}] ({record['pc_time_basis']})\n")
                     self.fault_text.insert("end", line + "\n")
                     self.fault_text.see("end")
+                    if isinstance(values.get("count"), int) and int(values["count"]) > 0:
+                        self._auto_pause_console("new Fault record")
             if line.startswith("OK admin unlocked"):
                 self.admin_state.set("Unlocked (5 min)")
                 self.admin_password.set("")
@@ -1109,7 +1224,7 @@ class GasChangerGui(tk.Tk):
                     writer.writerow((datetime.fromtimestamp(timestamp).isoformat(), definition.label, definition.path, value, definition.unit))
 
     def _refresh_events(self) -> None:
-        self.send_command(f"events {self.event_category.get()} 32")
+        self.send_command("events all 32")
 
     def _show_event_detail(self, _event: object = None) -> None:
         selection = self.event_tree.selection()
